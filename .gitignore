@@ -1,0 +1,16 @@
+# 编译产物（用 bash build.sh 生成）
+录屏助手.app/
+*.app/
+
+# 图标由 make-icon.swift + build.sh 自动生成
+AppIcon.icns
+icon.iconset/
+
+# macOS
+.DS_Store
+
+# 录制/截图输出（以防有人在仓库内测试）
+*.mov
+*.mp4
+*.png
+!docs/**/*.png
