@@ -41,9 +41,20 @@ CREATE_NO_WINDOW = 0x08000000  # 不弹 ffmpeg 控制台黑框
 
 
 def ffmpeg_path():
+    # 1) PyInstaller 打包进来的 ffmpeg.exe（_MEIPASS 或 exe 同目录）
+    cands = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        cands.append(os.path.join(base, "ffmpeg.exe"))
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "ffmpeg.exe"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    # 2) 系统 PATH
     p = shutil.which("ffmpeg")
     if p:
         return p
+    # 3) 常见安装位置
     for c in [r"C:\ffmpeg\bin\ffmpeg.exe",
               r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"]:
         if os.path.isfile(c):

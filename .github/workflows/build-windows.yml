@@ -1,0 +1,51 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:        # 可在 Actions 页手动点击运行
+  push:
+    tags: ["v*"]            # 推 v* 标签也会触发
+
+permissions:
+  contents: write           # 允许创建 Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install pillow pystray keyboard pyinstaller
+
+      - name: 下载并准备 ffmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_dl
+          $ff = Get-ChildItem ffmpeg_dl -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $ff.FullName ffmpeg.exe
+          Write-Host "ffmpeg ready:" (Get-Item ffmpeg.exe).Length "bytes"
+
+      - name: 打包 EXE（内置 ffmpeg）
+        run: pyinstaller --onefile --noconsole --name ScreenRecorder --add-binary "ffmpeg.exe;." windows/recorder.py
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenRecorder-windows-exe
+          path: dist/ScreenRecorder.exe
+
+      - name: 发布到 Release（win-latest，稳定下载链接）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-latest
+          name: Windows 版（最新构建）
+          body: |
+            Windows 单文件可执行程序（已内置 ffmpeg，双击即用）。
+            下载 `ScreenRecorder.exe` 后双击运行；托盘出现红点图标、桌面右上角出现控制条。
+            快捷键 Ctrl+R 录屏 / Ctrl+S 截图 / Ctrl+B 控制条（全局热键可能需以管理员身份运行）。
+          files: dist/ScreenRecorder.exe
