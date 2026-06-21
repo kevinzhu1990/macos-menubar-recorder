@@ -1,4 +1,15 @@
-# 录屏助手（菜单栏极简录屏）
+# 录屏助手 · macOS Menu-Bar Screen Recorder
+
+> **A minimalist macOS menu-bar screen recorder + screenshot tool.**
+> Full-screen recording with pause/resume and **unlimited duration** (auto-segments
+> around macOS's ~5-min `screencapture` limit and merges into one file), region
+> screenshots that are **auto-copied to the clipboard**, an optional mic track, and
+> three global hotkeys — `⌃R` record · `⌃S` screenshot · `⌃B` toggle the floating
+> control bar. No Dock icon, never steals focus. Single Swift file, builds with one
+> script, no app dependencies except `ffmpeg` (only used to merge segments).
+> *(Documentation below is in Chinese.)*
+
+---
 
 一个常驻 macOS 菜单栏的轻量录屏 + 截图工具，专为「边用 AI 边录屏」设计：
 不抢焦点、无 Dock 图标、按快捷键就开始。
