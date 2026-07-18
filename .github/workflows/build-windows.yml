@@ -3,6 +3,7 @@ name: Build Windows EXE
 on:
   workflow_dispatch:        # 可在 Actions 页手动点击运行
   push:
+    branches: ["main"]      # 合并或推送到 main 后自动构建最新版
     tags: ["v*"]            # 推 v* 标签也会触发
 
 permissions:
