@@ -300,10 +300,13 @@ class Recorder:
         self.btn_start = tk.Button(self.root, text="开始", width=5, command=self.start)
         self.btn_pause = tk.Button(self.root, text="暂停", width=5, command=self.pause_resume)
         self.btn_stop = tk.Button(self.root, text="结束", width=5, command=self.stop)
+        self.btn_shortcuts = tk.Button(
+            self.root, text="快捷键", width=6, command=self.show_shortcuts
+        )
         self.btn_collapse = tk.Button(self.root, text="▾", width=2, command=self.toggle_collapse)
         self.btn_close = tk.Button(self.root, text="✕", width=2, command=self.hide_bar)
         for b in (self.btn_start, self.btn_pause, self.btn_stop,
-                  self.btn_collapse, self.btn_close):
+                  self.btn_shortcuts, self.btn_collapse, self.btn_close):
             b.pack(side="left", padx=2, pady=8)
 
         # 拖动移动窗口
@@ -332,7 +335,8 @@ class Recorder:
 
     def _apply_collapse(self):
         show = not self.bar_collapsed
-        for b in (self.btn_start, self.btn_pause, self.btn_stop, self.btn_close):
+        for b in (self.btn_start, self.btn_pause, self.btn_stop,
+                  self.btn_shortcuts, self.btn_close):
             if show:
                 b.pack(side="left", padx=2, pady=8)
             else:
@@ -361,6 +365,85 @@ class Recorder:
             self.hide_bar()
         else:
             self.show_bar()
+
+    def show_shortcuts(self):
+        """显示快捷键和基础操作说明；重复点击时复用现有窗口。"""
+        win = getattr(self, "shortcut_win", None)
+        if win and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        self.shortcut_win = win
+        win.title("快捷键 · 录屏助手")
+        win.configure(bg="#1c1c1c")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+
+        def close():
+            self.shortcut_win = None
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Escape>", lambda _event: close())
+
+        tk.Label(
+            win, text="录屏助手快捷键", fg="white", bg="#1c1c1c",
+            font=("Microsoft YaHei UI", 16, "bold")
+        ).pack(padx=28, pady=(22, 4))
+
+        tk.Label(
+            win, text="记住这 3 个组合键，就能完成日常操作",
+            fg="#a8a8a8", bg="#1c1c1c",
+            font=("Microsoft YaHei UI", 9)
+        ).pack(padx=28, pady=(0, 16))
+
+        shortcuts = [
+            ("Ctrl + R", "开始 / 结束录屏"),
+            ("Ctrl + S", "框选截图并复制"),
+            ("Ctrl + B", "显示 / 隐藏控制条"),
+        ]
+        for key, action in shortcuts:
+            row = tk.Frame(win, bg="#292929")
+            row.pack(fill="x", padx=22, pady=4)
+
+            tk.Label(
+                row, text=key, width=11, anchor="center",
+                fg="white", bg="#3a3a3a",
+                font=("Consolas", 11, "bold")
+            ).pack(side="left", padx=8, pady=9)
+
+            tk.Label(
+                row, text=action, anchor="w",
+                fg="white", bg="#292929",
+                font=("Microsoft YaHei UI", 10)
+            ).pack(side="left", padx=(8, 16), pady=9)
+
+        tk.Label(
+            win,
+            text="也可以直接使用悬浮控制条或右下角托盘菜单。\n"
+                 "快捷键无响应时，请尝试以管理员身份运行。",
+            justify="left", fg="#b8b8b8", bg="#1c1c1c",
+            font=("Microsoft YaHei UI", 9)
+        ).pack(fill="x", padx=28, pady=(14, 12))
+
+        tk.Button(
+            win, text="知道了", width=12, command=close,
+            font=("Microsoft YaHei UI", 9)
+        ).pack(pady=(0, 20))
+
+        win.update_idletasks()
+        x = max(0, (win.winfo_screenwidth() - win.winfo_width()) // 2)
+        y = max(0, (win.winfo_screenheight() - win.winfo_height()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+        win.focus_force()
 
     # ---------- 计时/界面刷新 ----------
     def _elapsed_secs(self):
@@ -401,6 +484,8 @@ class Recorder:
 
     def _build_tray(self):
         menu = pystray.Menu(
+            pystray.MenuItem("快捷键 / 使用说明", lambda: self._ui(self.show_shortcuts)),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("显示/隐藏控制条 (Ctrl+B)", lambda: self._ui(self.toggle_bar)),
             pystray.MenuItem("开始/结束录屏 (Ctrl+R)",
                              lambda: self._ui(lambda: self.stop() if self.state != "idle" else self.start())),
