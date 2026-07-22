@@ -1,6 +1,9 @@
 import AppKit
 import Foundation
 import Carbon.HIToolbox
+import CoreGraphics
+import ImageIO
+import Vision
 
 // ============== 可改配置 ==============
 // 录屏保存目录（自动创建）
@@ -37,6 +40,8 @@ final class Recorder: NSObject, NSApplicationDelegate {
     let recQ = DispatchQueue(label: "rec.segments")  // 串行处理片段收尾/合并
     var timer: Timer?
     var lastFile: String?
+    var screenshotProcess: Process?
+    var scrollCapture: ScrollCaptureController?
     // 是否录制麦克风（开关状态记住，重启后保留）。默认开。
     var recordMic: Bool {
         get { UserDefaults.standard.object(forKey: "recordMic") as? Bool ?? true }
@@ -53,6 +58,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
     var btnStart: NSButton?
     var btnPause: NSButton?
     var btnStop: NSButton?
+    var btnShot: NSButton?
     var btnCollapse: NSButton?
     var btnClose: NSButton?
     // 控制条是否收起（只剩红点+计时）。记住状态。
@@ -60,7 +66,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
         get { UserDefaults.standard.bool(forKey: "barCollapsed") }
         set { UserDefaults.standard.set(newValue, forKey: "barCollapsed") }
     }
-    let barWidthFull: CGFloat = 340
+    let barWidthFull: CGFloat = 410
     let barWidthMin: CGFloat = 122
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -114,8 +120,16 @@ final class Recorder: NSObject, NSApplicationDelegate {
             menu.addItem(withTitle: state == .paused ? "继续录制" : "暂停录制",
                          action: #selector(pauseResume), keyEquivalent: "")
         }
-        menu.addItem(withTitle: "截图（框选）  ⌃S",
+        menu.addItem(withTitle: "快速框选截图  ⌃S",
                      action: #selector(takeScreenshot), keyEquivalent: "")
+        menu.addItem(withTitle: "打开完整截图工具",
+                     action: #selector(takeScreenshotWithToolbar), keyEquivalent: "")
+        menu.addItem(withTitle: "框选截图并标注",
+                     action: #selector(takeScreenshotAndAnnotate), keyEquivalent: "")
+        menu.addItem(withTitle: "框选识别文字（OCR）",
+                     action: #selector(takeScreenshotAndRecognizeText), keyEquivalent: "")
+        menu.addItem(withTitle: "滚动截长图",
+                     action: #selector(takeScrollingScreenshot), keyEquivalent: "")
         menu.addItem(.separator())
         let micItem = NSMenuItem(title: "录制麦克风声音",
                                  action: #selector(toggleMic), keyEquivalent: "")
@@ -311,16 +325,46 @@ final class Recorder: NSObject, NSApplicationDelegate {
     }
 
     // ---- 截图 ----
-    @objc func takeScreenshot() {
+    enum ScreenshotMode: Equatable {
+        case quick
+        case toolbar
+        case annotate
+        case ocr
+    }
+
+    // 快速框选保留原来的一键体验；完整工具可选区域/窗口/全屏；标注模式会打开预览。
+    @objc func takeScreenshot() { captureScreenshot(mode: .quick) }
+    @objc func takeScreenshotWithToolbar() { captureScreenshot(mode: .toolbar) }
+    @objc func takeScreenshotAndAnnotate() { captureScreenshot(mode: .annotate) }
+    @objc func takeScreenshotAndRecognizeText() { captureScreenshot(mode: .ocr) }
+
+    func captureScreenshot(mode: ScreenshotMode) {
+        // 避免连续按快捷键时叠出多个系统截图层。
+        guard screenshotProcess == nil else {
+            NSSound.beep()
+            return
+        }
         let path = "\(shotDir)/截图_\(timestamp()).png"
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        // -i 交互式框选（也可空格切换窗口模式）  -x 静音
-        p.arguments = ["-i", "-x", path]
+        switch mode {
+        case .quick, .annotate, .ocr:
+            // -s 限定框选，避免快捷模式误切到窗口截图。
+            p.arguments = ["-i", "-s", "-x", path]
+        case .toolbar:
+            // 系统完整截图栏：区域、窗口、全屏和延时等选项。
+            p.arguments = ["-i", "-U", "-x", path]
+        }
+        screenshotProcess = p
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
+                self?.screenshotProcess = nil
                 guard FileManager.default.fileExists(atPath: path) else { return }
                 self?.lastFile = path
+                if mode == .ocr {
+                    self?.recognizeText(at: URL(fileURLWithPath: path))
+                    return
+                }
                 // 同时拷到剪贴板，截完可直接 ⌘V 粘到微信等
                 let pb = NSPasteboard.general
                 pb.clearContents()
@@ -330,9 +374,81 @@ final class Recorder: NSObject, NSApplicationDelegate {
                         pb.setData(tiff, forType: .tiff)   // 兼容更多 App
                     }
                 }
+                if mode == .annotate {
+                    // 用系统默认图片 App 打开；macOS 默认即“预览”，可直接使用标记工具栏。
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
             }
         }
-        try? p.run()
+        do {
+            try p.run()
+        } catch {
+            screenshotProcess = nil
+            alert("截图启动失败", error.localizedDescription)
+        }
+    }
+
+    // 使用系统 Vision 在本机识别中英文；图片不上传，识别结果直接进入剪贴板。
+    func recognizeText(at url: URL) {
+        let request = VNRecognizeTextRequest { [weak self] request, error in
+            let observations = request.results as? [VNRecognizedTextObservation] ?? []
+            let text = observations.compactMap { $0.topCandidates(1).first?.string }
+                                   .joined(separator: "\n")
+            DispatchQueue.main.async {
+                if let error = error {
+                    self?.alert("文字识别失败", error.localizedDescription)
+                    return
+                }
+                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    self?.alert("没有识别到文字", "请重新框选更清晰、范围更准确的文字区域。")
+                    return
+                }
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(text, forType: .string)
+                NSSound(named: "Glass")?.play()
+            }
+        }
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try VNImageRequestHandler(url: url, options: [:]).perform([request])
+            } catch {
+                DispatchQueue.main.async {
+                    self?.alert("文字识别失败", error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    @objc func takeScrollingScreenshot() {
+        guard screenshotProcess == nil, scrollCapture == nil else {
+            NSSound.beep()
+            return
+        }
+        let output = URL(fileURLWithPath: "\(shotDir)/长截图_\(timestamp()).png")
+        let controller = ScrollCaptureController(outputURL: output) { [weak self] result in
+            guard let self = self else { return }
+            self.scrollCapture = nil
+            switch result {
+            case .success(let url):
+                self.lastFile = url.path
+                if let png = try? Data(contentsOf: url) {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setData(png, forType: .png)
+                }
+                NSSound(named: "Glass")?.play()
+            case .failure(let message):
+                self.alert("长截图失败", message)
+            case .cancelled:
+                break
+            }
+        }
+        scrollCapture = controller
+        controller.start()
     }
 
     // ---- 全局快捷键（Carbon，全系统生效，无需辅助功能权限）----
@@ -433,9 +549,12 @@ final class Recorder: NSObject, NSApplicationDelegate {
         btnStart = makeBtn("开始", #selector(start))
         btnPause = makeBtn("暂停", #selector(pauseResume))
         btnStop  = makeBtn("结束", #selector(stop))
+        btnShot  = makeBtn("截图", #selector(takeScreenshotWithToolbar))
         btnCollapse = makeBtn("▾", #selector(toggleCollapse))   // 缩小/展开
         btnClose = makeBtn("✕", #selector(hideBar))             // 隐藏
-        for b in [btnStart!, btnPause!, btnStop!, btnCollapse!, btnClose!] { v.addSubview(b) }
+        for b in [btnStart!, btnPause!, btnStop!, btnShot!, btnCollapse!, btnClose!] {
+            v.addSubview(b)
+        }
 
         bar = w
         applyCollapse(barCollapsed)   // 按记住的状态排布
@@ -461,10 +580,12 @@ final class Recorder: NSObject, NSApplicationDelegate {
         btnStart?.frame = NSRect(x: 92, y: 10, width: 52, height: 30)
         btnPause?.frame = NSRect(x: 148, y: 10, width: 52, height: 30)
         btnStop?.frame  = NSRect(x: 204, y: 10, width: 52, height: 30)
+        btnShot?.frame  = NSRect(x: 260, y: 10, width: 52, height: 30)
         btnClose?.frame = NSRect(x: barWidthFull - 38, y: 13, width: 28, height: 24)
         btnStart?.isHidden = c
         btnPause?.isHidden = c
         btnStop?.isHidden = c
+        btnShot?.isHidden = c
         btnClose?.isHidden = c
         // 折叠按钮：折叠时贴在计时后面，展开时在右侧
         btnCollapse?.frame = c ? NSRect(x: 84, y: 13, width: 30, height: 24)
@@ -544,6 +665,362 @@ final class Recorder: NSObject, NSApplicationDelegate {
             }
         }
         NSApp.terminate(nil)
+    }
+}
+
+enum ScrollCaptureResult {
+    case success(URL)
+    case failure(String)
+    case cancelled
+}
+
+// 手动滚动、自动采集与拼接。第一版限定主屏幕内的纵向滚动区域。
+final class ScrollCaptureController: NSObject {
+    let outputURL: URL
+    let completion: (ScrollCaptureResult) -> Void
+    var selectionWindow: NSWindow?
+    var controlPanel: NSPanel?
+    var statusLabel: NSTextField?
+    var captureRect = CGRect.zero       // Core Graphics 全局坐标（主屏左上角为原点）
+    var frames: [CGImage] = []
+    var timer: Timer?
+    var startedAt = Date()
+    let maxFrames = 80
+    let maxSeconds: TimeInterval = 120
+
+    init(outputURL: URL, completion: @escaping (ScrollCaptureResult) -> Void) {
+        self.outputURL = outputURL
+        self.completion = completion
+    }
+
+    func start() {
+        guard let screen = NSScreen.main else {
+            completion(.failure("未找到主屏幕。"))
+            return
+        }
+        let window = NSWindow(contentRect: screen.frame,
+                              styleMask: .borderless,
+                              backing: .buffered,
+                              defer: false)
+        window.setFrame(screen.frame, display: true)
+        window.level = .screenSaver
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = false
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let view = ScrollSelectionView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        view.onCancel = { [weak self] in self?.cancel() }
+        view.onSelection = { [weak self, weak screen] rect in
+            guard let self = self, let screen = screen else { return }
+            self.acceptSelection(rect, on: screen)
+        }
+        window.contentView = view
+        selectionWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(view)
+    }
+
+    func acceptSelection(_ rect: CGRect, on screen: NSScreen) {
+        guard rect.width >= 160, rect.height >= 120 else {
+            NSSound.beep()
+            return
+        }
+        // 当前仅支持主屏：AppKit 左下原点 → CG 左上原点。
+        captureRect = CGRect(x: rect.minX,
+                             y: screen.frame.height - rect.maxY,
+                             width: rect.width,
+                             height: rect.height).integral
+        selectionWindow?.orderOut(nil)
+        selectionWindow = nil
+        showControls(on: screen)
+        frames.removeAll(keepingCapacity: true)
+        startedAt = Date()
+        captureFrame()
+        let t = Timer(timeInterval: 0.65, repeats: true) { [weak self] _ in
+            self?.captureFrame()
+        }
+        timer = t
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    func showControls(on screen: NSScreen) {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 330, height: 58),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.backgroundColor = NSColor(white: 0.10, alpha: 0.96)
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.sharingType = .none
+
+        let label = NSTextField(labelWithString: "请向下滚动页面 · 已采集 0 帧")
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.frame = NSRect(x: 14, y: 20, width: 190, height: 20)
+        panel.contentView?.addSubview(label)
+        statusLabel = label
+
+        let finish = NSButton(title: "完成", target: self, action: #selector(finish))
+        finish.bezelStyle = .rounded
+        finish.frame = NSRect(x: 208, y: 14, width: 56, height: 30)
+        panel.contentView?.addSubview(finish)
+        let cancel = NSButton(title: "取消", target: self, action: #selector(cancel))
+        cancel.bezelStyle = .rounded
+        cancel.frame = NSRect(x: 266, y: 14, width: 56, height: 30)
+        panel.contentView?.addSubview(cancel)
+
+        let visible = screen.visibleFrame
+        panel.setFrameOrigin(NSPoint(x: visible.maxX - panel.frame.width - 18,
+                                     y: visible.maxY - panel.frame.height - 14))
+        controlPanel = panel
+        panel.orderFrontRegardless()
+    }
+
+    func captureFrame() {
+        guard frames.count < maxFrames,
+              Date().timeIntervalSince(startedAt) < maxSeconds else {
+            finish()
+            return
+        }
+        guard let image = captureRegion(), image.width > 0, image.height > 0 else { return }
+        if let previous = frames.last, imageDifference(previous, image) < 2.0 { return }
+        frames.append(image)
+        statusLabel?.stringValue = "请向下滚动页面 · 已采集 \(frames.count) 帧"
+    }
+
+    // 使用系统截图命令按固定坐标采集，兼容 macOS 13+，并沿用 App 已有的屏幕录制权限。
+    func captureRegion() -> CGImage? {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("scroll_capture_\(UUID().uuidString).png")
+        let rect = "\(Int(captureRect.minX)),\(Int(captureRect.minY))," +
+                   "\(Int(captureRect.width)),\(Int(captureRect.height))"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        process.arguments = ["-x", "-R", rect, temp.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            defer { try? FileManager.default.removeItem(at: temp) }
+            guard process.terminationStatus == 0,
+                  let source = CGImageSourceCreateWithURL(temp as CFURL, nil) else { return nil }
+            return CGImageSourceCreateImageAtIndex(source, 0, nil)
+        } catch {
+            try? FileManager.default.removeItem(at: temp)
+            return nil
+        }
+    }
+
+    @objc func finish() {
+        timer?.invalidate()
+        timer = nil
+        controlPanel?.orderOut(nil)
+        controlPanel = nil
+        let captured = frames
+        frames.removeAll()
+        guard captured.count >= 2 else {
+            completion(.failure("采集帧数不足。框选后请至少向下滚动一次，再点击“完成”。"))
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [outputURL, completion] in
+            let result = Self.stitch(captured, to: outputURL)
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    @objc func cancel() {
+        timer?.invalidate()
+        timer = nil
+        selectionWindow?.orderOut(nil)
+        controlPanel?.orderOut(nil)
+        selectionWindow = nil
+        controlPanel = nil
+        frames.removeAll()
+        completion(.cancelled)
+    }
+
+    // 低分辨率灰度采样，过滤页面静止时采到的重复帧。
+    func imageDifference(_ a: CGImage, _ b: CGImage) -> Double {
+        guard let ga = Self.grayThumbnail(a, width: 96),
+              let gb = Self.grayThumbnail(b, width: 96), ga.count == gb.count else { return 100 }
+        var total = 0
+        for i in stride(from: 0, to: ga.count, by: 5) {
+            total += abs(Int(ga[i]) - Int(gb[i]))
+        }
+        return Double(total) / Double(max(1, ga.count / 5))
+    }
+
+    static func grayThumbnail(_ image: CGImage, width: Int) -> [UInt8]? {
+        let height = max(1, Int(Double(image.height) * Double(width) / Double(image.width)))
+        var data = [UInt8](repeating: 0, count: width * height)
+        let ok = data.withUnsafeMutableBytes { bytes -> Bool in
+            guard let ctx = CGContext(data: bytes.baseAddress, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: width,
+                                      space: CGColorSpaceCreateDeviceGray(),
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
+            ctx.interpolationQuality = .low
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        return ok ? data : nil
+    }
+
+    static func bestOverlap(_ previous: CGImage, _ next: CGImage) -> Int? {
+        let thumbWidth = 160
+        guard previous.width == next.width, previous.height == next.height,
+              let a = grayThumbnail(previous, width: thumbWidth),
+              let b = grayThumbnail(next, width: thumbWidth) else { return nil }
+        let h = a.count / thumbWidth
+        let minOverlap = max(24, Int(Double(h) * 0.12))
+        let maxOverlap = Int(Double(h) * 0.94)
+        let x0 = Int(Double(thumbWidth) * 0.12)
+        let x1 = Int(Double(thumbWidth) * 0.88)
+        var best: (overlap: Int, score: Double)?
+
+        for overlap in stride(from: minOverlap, through: maxOverlap, by: 2) {
+            // 忽略重叠区最上/下边缘，降低吸顶栏和滚动条动画的干扰。
+            let margin = max(3, min(18, overlap / 10))
+            var total = 0
+            var count = 0
+            if overlap <= margin * 2 { continue }
+            for y in stride(from: margin, to: overlap - margin, by: 3) {
+                let ay = h - overlap + y
+                for x in stride(from: x0, to: x1, by: 3) {
+                    total += abs(Int(a[ay * thumbWidth + x]) - Int(b[y * thumbWidth + x]))
+                    count += 1
+                }
+            }
+            guard count > 0 else { continue }
+            let score = Double(total) / Double(count)
+            if best == nil || score < best!.score { best = (overlap, score) }
+        }
+        guard let match = best, match.score < 30 else { return nil }
+        let scale = Double(previous.width) / Double(thumbWidth)
+        return min(previous.height - 1, max(1, Int(Double(match.overlap) * scale)))
+    }
+
+    static func stitch(_ input: [CGImage], to url: URL) -> ScrollCaptureResult {
+        guard let first = input.first else { return .failure("没有可拼接的截图。") }
+        var accepted = [first]
+        var overlaps: [Int] = []
+        for image in input.dropFirst() {
+            guard let overlap = bestOverlap(accepted.last!, image) else { continue }
+            // 近乎完全重叠的帧不增加内容，直接丢弃。
+            if overlap >= Int(Double(image.height) * 0.93) { continue }
+            overlaps.append(overlap)
+            accepted.append(image)
+        }
+        guard accepted.count >= 2 else {
+            return .failure("没有找到稳定的重叠区域。请缓慢分段滚动，并避免视频、动画或大面积闪烁内容。")
+        }
+        let width = first.width
+        let totalHeight = first.height + zip(accepted.dropFirst(), overlaps).reduce(0) {
+            $0 + $1.0.height - $1.1
+        }
+        let estimatedBytes = Int64(width) * Int64(totalHeight) * 4
+        guard totalHeight <= 60_000, estimatedBytes <= 500 * 1024 * 1024 else {
+            return .failure("长图过大（预计超过 500 MB）。请缩小框选宽度或分两次截取。")
+        }
+        guard let ctx = CGContext(data: nil, width: width, height: totalHeight,
+                                  bitsPerComponent: 8, bytesPerRow: width * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return .failure("无法创建长图画布。")
+        }
+        var consumed = 0
+        ctx.draw(first, in: CGRect(x: 0, y: totalHeight - first.height,
+                                   width: width, height: first.height))
+        consumed += first.height
+        for (image, overlap) in zip(accepted.dropFirst(), overlaps) {
+            let cropHeight = image.height - overlap
+            guard cropHeight > 0,
+                  let crop = image.cropping(to: CGRect(x: 0, y: overlap,
+                                                       width: image.width, height: cropHeight)) else { continue }
+            let y = totalHeight - consumed - cropHeight
+            ctx.draw(crop, in: CGRect(x: 0, y: y, width: width, height: cropHeight))
+            consumed += cropHeight
+        }
+        guard let output = ctx.makeImage() else { return .failure("长图渲染失败。") }
+        let rep = NSBitmapImageRep(cgImage: output)
+        guard let png = rep.representation(using: .png, properties: [:]) else {
+            return .failure("PNG 编码失败。")
+        }
+        do {
+            try png.write(to: url, options: .atomic)
+            return .success(url)
+        } catch {
+            return .failure("保存失败：\(error.localizedDescription)")
+        }
+    }
+}
+
+final class ScrollSelectionView: NSView {
+    var startPoint: CGPoint?
+    var selectedRect = CGRect.zero
+    var onSelection: ((CGRect) -> Void)?
+    var onCancel: (() -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        startPoint = convert(event.locationInWindow, from: nil)
+        selectedRect = .zero
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = startPoint else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        selectedRect = CGRect(x: min(start.x, p.x), y: min(start.y, p.y),
+                              width: abs(p.x - start.x), height: abs(p.y - start.y))
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard selectedRect.width >= 160, selectedRect.height >= 120 else {
+            NSSound.beep()
+            return
+        }
+        onSelection?(selectedRect.integral)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { onCancel?() } else { super.keyDown(with: event) }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(white: 0, alpha: 0.48).setFill()
+        bounds.fill()
+        if !selectedRect.isEmpty {
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: selectedRect).addClip()
+            NSColor.clear.setFill()
+            selectedRect.fill(using: .copy)
+            NSGraphicsContext.restoreGraphicsState()
+            let border = NSBezierPath(rect: selectedRect)
+            border.lineWidth = 2
+            NSColor.systemBlue.setStroke()
+            border.stroke()
+            let label = "\(Int(selectedRect.width)) × \(Int(selectedRect.height))"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: NSColor.white,
+                .backgroundColor: NSColor(white: 0.1, alpha: 0.85),
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)]
+            NSAttributedString(string: " \(label) ", attributes: attrs)
+                .draw(at: NSPoint(x: selectedRect.minX, y: max(4, selectedRect.minY - 22)))
+        } else {
+            let text = "拖动框选要滚动截取的区域 · Esc 取消"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: NSColor.white,
+                .font: NSFont.systemFont(ofSize: 20, weight: .semibold)]
+            let s = NSAttributedString(string: text, attributes: attrs)
+            s.draw(at: NSPoint(x: bounds.midX - s.size().width / 2,
+                               y: bounds.midY - s.size().height / 2))
+        }
     }
 }
 
