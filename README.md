@@ -4,7 +4,7 @@
 > Full-screen recording with pause/resume and **unlimited duration** (auto-segments
 > around macOS's ~5-min `screencapture` limit and merges into one file), region
 > screenshots that are **auto-copied to the clipboard**, an optional mic track, and
-> three global hotkeys — `⌃R` record · `⌃S` screenshot · `⌃B` toggle the floating
+> global hotkeys — `⌃R` record · `⌃S` / `⌘⇧X` screenshot · `⌃B` toggle the floating
 > control bar. No Dock icon, never steals focus. Single Swift file, builds with one
 > script, no app dependencies except `ffmpeg` (only used to merge segments).
 > *(Documentation below is in Chinese.)*
@@ -23,7 +23,7 @@
 - **截图**：支持快捷框选、macOS 完整截图栏（区域/窗口/全屏/延时）、“截图后标注”、
   本地 OCR 文字识别和滚动长截图；完成后自动保存并复制图片或识别出的文字到剪贴板。
 - 录屏可选**同时录麦克风**（控制条/菜单里开关，默认开）。
-- **桌面控制条**：屏幕右上角浮动小条（红点+计时+开始/暂停/结束/截图按钮），可拖动、
+- **桌面控制条**：屏幕右上角浮动小条（红点+计时+开始/暂停/结束/截图/长截图按钮），可拖动、
   可缩小（▾）、可隐藏（✕），始终置顶、所有桌面可见。
 - 仅「合并分段」用到 `ffmpeg`（`brew install ffmpeg`）；录制本身不依赖它。
 
@@ -41,7 +41,7 @@
 2. 双击 `录屏助手.app` 启动，菜单栏右上角出现一个圆点图标 ●。
 
 ## 使用
-- **桌面控制条**：右上角的 `●  00:00  [开始][暂停][结束][截图] ▾ ✕`，直接点按钮控制。
+- **桌面控制条**：右上角的 `●  00:00  [开始][暂停][结束][截图][长截图] ▾ ✕`，直接点按钮控制。
   `▾` 缩小成只剩红点+计时，`✕` 隐藏。
 - **菜单栏图标**（红点 ●「录屏」）：左键 → 控制条隐藏时呼出、显示时开始/停止录屏；
   右键（或按住 Control 左键）→ 完整菜单。
@@ -51,10 +51,10 @@
 | 快捷键 | 功能 |
 |---|---|
 | **⌃R**（Control+R） | 开始 / 结束录屏 |
-| **⌃S**（Control+S） | 框选截图 |
+| **⌃S**（Control+S）或 **⌘⇧X**（Command+Shift+X） | 快速框选截图，自动复制到剪贴板 |
 | **⌃B**（Control+B） | 呼出 / 隐藏桌面控制条（呼出时弹回右上角） |
 
-按 `⌃S` 是最快的区域框选；控制条的“截图”会打开 macOS 完整截图栏，可切换区域、窗口、
+按 `⌃S` 或 `⌘⇧X` 是最快的区域框选；控制条的“截图”会打开 macOS 完整截图栏，可切换区域、窗口、
 全屏并使用系统延时选项；菜单栏右键还可选择“框选截图并标注”，完成后自动打开图片 App，
 可继续画箭头、方框、文字和签名；“框选识别文字（OCR）”会用 macOS Vision 在本机识别
 中英文并把文字复制到剪贴板，不会上传图片。Esc 可随时取消。
@@ -67,7 +67,8 @@
 
 当前版本支持主屏幕内的纵向滚动。为提高成功率，请避免框内出现视频、大面积动画或持续闪烁，
 并让相邻两次滚动保留至少约 15% 的重叠内容；最长采集 120 秒或 80 帧。
-截图会**同时保存文件并复制到剪贴板**，所以截完可直接到微信等处按 `⌘V` 粘贴。
+普通截图和长截图都会**同时保存文件并默认复制到剪贴板**，所以截完可直接到微信、飞书、
+文档等位置按 `⌘V` 粘贴。
 
 文件默认保存：录屏 → **`~/Movies/录屏/`**，截图 → **`~/Pictures/截图/`**，均带时间戳。
 想改目录或快捷键，编辑 `recorder.swift` 顶部的配置区后重新 `bash build.sh`

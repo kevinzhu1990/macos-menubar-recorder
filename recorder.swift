@@ -12,11 +12,13 @@ let recordDir = ("~/Movies/录屏" as NSString).expandingTildeInPath
 let shotDir = ("~/Pictures/截图" as NSString).expandingTildeInPath
 
 // 全局快捷键（虚拟键码 + 修饰键）。键码见文件底部对照表。
-// 默认：录屏 = Control+R，截图 = Control+S（两键）
+// 默认：录屏 = Control+R；截图同时支持 Control+S 和 Command+Shift+X。
 let recordKeyCode: UInt32 = 0x0F                       // R
 let recordKeyMods: UInt32 = UInt32(controlKey)
 let shotKeyCode:   UInt32 = 0x01                       // S
 let shotKeyMods:   UInt32 = UInt32(controlKey)
+let macShotKeyCode: UInt32 = 0x07                      // X
+let macShotKeyMods: UInt32 = UInt32(cmdKey | shiftKey) // Command+Shift+X
 let barKeyCode:    UInt32 = 0x0B                       // B = 呼出/隐藏控制条
 let barKeyMods:    UInt32 = UInt32(controlKey)
 // ====================================
@@ -59,6 +61,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
     var btnPause: NSButton?
     var btnStop: NSButton?
     var btnShot: NSButton?
+    var btnLongShot: NSButton?
     var btnCollapse: NSButton?
     var btnClose: NSButton?
     // 控制条是否收起（只剩红点+计时）。记住状态。
@@ -66,7 +69,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
         get { UserDefaults.standard.bool(forKey: "barCollapsed") }
         set { UserDefaults.standard.set(newValue, forKey: "barCollapsed") }
     }
-    let barWidthFull: CGFloat = 410
+    let barWidthFull: CGFloat = 480
     let barWidthMin: CGFloat = 122
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -120,7 +123,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
             menu.addItem(withTitle: state == .paused ? "继续录制" : "暂停录制",
                          action: #selector(pauseResume), keyEquivalent: "")
         }
-        menu.addItem(withTitle: "快速框选截图  ⌃S",
+        menu.addItem(withTitle: "快速框选截图  ⌃S / ⌘⇧X",
                      action: #selector(takeScreenshot), keyEquivalent: "")
         menu.addItem(withTitle: "打开完整截图工具",
                      action: #selector(takeScreenshotWithToolbar), keyEquivalent: "")
@@ -365,15 +368,8 @@ final class Recorder: NSObject, NSApplicationDelegate {
                     self?.recognizeText(at: URL(fileURLWithPath: path))
                     return
                 }
-                // 同时拷到剪贴板，截完可直接 ⌘V 粘到微信等
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                if let png = try? Data(contentsOf: URL(fileURLWithPath: path)) {
-                    pb.setData(png, forType: .png)
-                    if let img = NSImage(data: png), let tiff = img.tiffRepresentation {
-                        pb.setData(tiff, forType: .tiff)   // 兼容更多 App
-                    }
-                }
+                // 默认写入剪贴板，截完可直接 ⌘V 粘到微信、飞书或文档。
+                self?.copyImageToClipboard(at: URL(fileURLWithPath: path))
                 if mode == .annotate {
                     // 用系统默认图片 App 打开；macOS 默认即“预览”，可直接使用标记工具栏。
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
@@ -386,6 +382,20 @@ final class Recorder: NSObject, NSApplicationDelegate {
             screenshotProcess = nil
             alert("截图启动失败", error.localizedDescription)
         }
+    }
+
+    @discardableResult
+    func copyImageToClipboard(at url: URL) -> Bool {
+        guard let png = try? Data(contentsOf: url), let image = NSImage(data: png) else {
+            return false
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setData(png, forType: .png)
+        if let tiff = image.tiffRepresentation {
+            pb.setData(tiff, forType: .tiff)   // 兼容更多可接收图片粘贴的 App
+        }
+        return true
     }
 
     // 使用系统 Vision 在本机识别中英文；图片不上传，识别结果直接进入剪贴板。
@@ -435,11 +445,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
             switch result {
             case .success(let url):
                 self.lastFile = url.path
-                if let png = try? Data(contentsOf: url) {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setData(png, forType: .png)
-                }
+                self.copyImageToClipboard(at: url)
                 NSSound(named: "Glass")?.play()
             case .failure(let message):
                 self.alert("长截图失败", message)
@@ -465,6 +471,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
                 case 1: Recorder.shared?.toggle()
                 case 2: Recorder.shared?.takeScreenshot()
                 case 3: Recorder.shared?.toggleBar()
+                case 4: Recorder.shared?.takeScreenshot()
                 default: break
                 }
             }
@@ -474,6 +481,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
         register(id: 1, keyCode: recordKeyCode, mods: recordKeyMods)
         register(id: 2, keyCode: shotKeyCode,   mods: shotKeyMods)
         register(id: 3, keyCode: barKeyCode,    mods: barKeyMods)
+        register(id: 4, keyCode: macShotKeyCode, mods: macShotKeyMods)
     }
 
     func register(id: UInt32, keyCode: UInt32, mods: UInt32) {
@@ -550,9 +558,11 @@ final class Recorder: NSObject, NSApplicationDelegate {
         btnPause = makeBtn("暂停", #selector(pauseResume))
         btnStop  = makeBtn("结束", #selector(stop))
         btnShot  = makeBtn("截图", #selector(takeScreenshotWithToolbar))
+        btnLongShot = makeBtn("长截图", #selector(takeScrollingScreenshot))
         btnCollapse = makeBtn("▾", #selector(toggleCollapse))   // 缩小/展开
         btnClose = makeBtn("✕", #selector(hideBar))             // 隐藏
-        for b in [btnStart!, btnPause!, btnStop!, btnShot!, btnCollapse!, btnClose!] {
+        for b in [btnStart!, btnPause!, btnStop!, btnShot!, btnLongShot!,
+                  btnCollapse!, btnClose!] {
             v.addSubview(b)
         }
 
@@ -581,11 +591,13 @@ final class Recorder: NSObject, NSApplicationDelegate {
         btnPause?.frame = NSRect(x: 148, y: 10, width: 52, height: 30)
         btnStop?.frame  = NSRect(x: 204, y: 10, width: 52, height: 30)
         btnShot?.frame  = NSRect(x: 260, y: 10, width: 52, height: 30)
+        btnLongShot?.frame = NSRect(x: 316, y: 10, width: 64, height: 30)
         btnClose?.frame = NSRect(x: barWidthFull - 38, y: 13, width: 28, height: 24)
         btnStart?.isHidden = c
         btnPause?.isHidden = c
         btnStop?.isHidden = c
         btnShot?.isHidden = c
+        btnLongShot?.isHidden = c
         btnClose?.isHidden = c
         // 折叠按钮：折叠时贴在计时后面，展开时在右侧
         btnCollapse?.frame = c ? NSRect(x: 84, y: 13, width: 30, height: 24)
