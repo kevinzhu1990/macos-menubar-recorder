@@ -20,6 +20,7 @@ import shutil
 import threading
 import subprocess
 import ctypes
+import wave
 from datetime import datetime
 
 import tkinter as tk
@@ -128,6 +129,78 @@ def choose_system_audio_device(ff):
             return name, devices
 
     return None, devices
+
+
+class LoopbackAudioRecorder:
+    def __init__(self, path):
+        self.path = path
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.error = None
+        self.started = threading.Event()
+        self.ready = False
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        self.started.wait(timeout=3)
+        return self.ready
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=5)
+        return self.path if os.path.isfile(self.path) and os.path.getsize(self.path) > 44 else None
+
+    def _run(self):
+        pa = None
+        stream = None
+        wf = None
+        try:
+            import pyaudiowpatch as pyaudio
+
+            pa = pyaudio.PyAudio()
+            device = pa.get_default_wasapi_loopback()
+            channels = int(device.get("maxInputChannels") or 2)
+            rate = int(device.get("defaultSampleRate") or 48000)
+            fmt = pyaudio.paInt16
+            wf = wave.open(self.path, "wb")
+            wf.setnchannels(channels)
+            wf.setsampwidth(pa.get_sample_size(fmt))
+            wf.setframerate(rate)
+            stream = pa.open(
+                format=fmt,
+                channels=channels,
+                rate=rate,
+                input=True,
+                input_device_index=device["index"],
+                frames_per_buffer=1024,
+            )
+            self.ready = True
+            self.started.set()
+            while not self.stop_event.is_set():
+                data = stream.read(1024, exception_on_overflow=False)
+                wf.writeframes(data)
+        except Exception as e:
+            self.error = e
+            self.started.set()
+        finally:
+            try:
+                if stream:
+                    stream.stop_stream()
+                    stream.close()
+            except Exception:
+                pass
+            try:
+                if wf:
+                    wf.close()
+            except Exception:
+                pass
+            try:
+                if pa:
+                    pa.terminate()
+            except Exception:
+                pass
 
 
 class RegionSelector:
@@ -346,6 +419,7 @@ class Recorder:
         self.state = "idle"            # idle / recording / paused
         self.proc = None               # 当前片段 ffmpeg 进程
         self.cur_seg = None
+        self.cur_audio = None
         self.segments = []
         self.final_path = None
         self.record_region = None      # (x, y, width, height)
@@ -364,45 +438,43 @@ class Recorder:
         self._tick()
 
     # ---------- 录制 ----------
-    def _seg_cmd(self, seg, use_audio, audio_name):
+    def _seg_cmd(self, seg):
         cmd = [self.ff, "-y", "-f", "gdigrab", "-framerate", FRAMERATE]
         if self.record_region:
             x, y, w, h = self.record_region
             cmd += ["-offset_x", str(x), "-offset_y", str(y),
                     "-video_size", f"{w}x{h}"]
         cmd += ["-i", "desktop"]
-        if use_audio and audio_name:
-            cmd += ["-f", "dshow", "-i", "audio=" + audio_name]
         cmd += ["-c:v", "libx264", "-preset", "ultrafast",
                 "-pix_fmt", "yuv420p", "-crf", VIDEO_BITRATE_CRF]
-        if use_audio and audio_name:
-            cmd += ["-c:a", "aac", "-b:a", "128k"]
         cmd.append(seg)
         return cmd
 
     def _launch_segment(self):
-        seg = os.path.join(RECORD_DIR, f".seg_{uuid.uuid4().hex}.mp4")
-        audio_name, audio_devices = (choose_system_audio_device(self.ff)
-                                     if self.record_system_audio else (None, []))
-        if self.record_system_audio and not audio_name:
-            found = "、".join(audio_devices) if audio_devices else "没有检测到任何音频输入设备"
-            self._alert(
-                "没有检测到可录电脑内部声音的设备，已取消录制。\n\n"
-                "请在 Windows 声音设置里启用“立体声混音”，或安装 VB-CABLE 这类虚拟声卡，"
-                "再重新开始录屏。\n\n"
-                f"当前检测到：{found}"
-            )
-            return False
-        cmd = self._seg_cmd(seg, self.record_system_audio, audio_name)
+        seg = os.path.join(RECORD_DIR, f".video_{uuid.uuid4().hex}.mp4")
+        audio = None
+        if self.record_system_audio:
+            audio_path = os.path.join(RECORD_DIR, f".audio_{uuid.uuid4().hex}.wav")
+            audio = LoopbackAudioRecorder(audio_path)
+            if not audio.start():
+                self._alert(
+                    "无法启动电脑内部声音录制，已取消录制。\n\n"
+                    "请确认 Windows 默认输出设备可正常播放声音，然后重新开始录屏。"
+                )
+                return False
+        cmd = self._seg_cmd(seg)
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                          stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL,
                                          creationflags=CREATE_NO_WINDOW)
         except Exception as e:
+            if audio:
+                audio.stop()
             self._alert(f"启动录制失败：{e}")
             return False
         self.cur_seg = seg
+        self.cur_audio = audio
         self.seg_start = time.time()
         return True
 
@@ -444,9 +516,9 @@ class Recorder:
             self.recorded_before += time.time() - (self.seg_start or time.time())
             self.seg_start = None
             self.state = "paused"
-            proc, seg = self.proc, self.cur_seg
-            self.proc, self.cur_seg = None, None
-            threading.Thread(target=self._finalize_seg, args=(proc, seg),
+            proc, seg, audio = self.proc, self.cur_seg, self.cur_audio
+            self.proc, self.cur_seg, self.cur_audio = None, None, None
+            threading.Thread(target=self._finalize_seg, args=(proc, seg, audio),
                              daemon=True).start()
             self._update_ui()
         elif self.state == "paused":
@@ -454,11 +526,13 @@ class Recorder:
                 self.state = "recording"
                 self._update_ui()
 
-    def _finalize_seg(self, proc, seg):
+    def _finalize_seg(self, proc, seg, audio=None):
+        audio_path = audio.stop() if audio else None
         self._stop_proc(proc)
+        final_seg = self._mux_segment(seg, audio_path)
         with self.lock:
-            if seg and os.path.isfile(seg):
-                self.segments.append(seg)
+            if final_seg and os.path.isfile(final_seg):
+                self.segments.append(final_seg)
 
     def stop(self):
         if self.state == "idle":
@@ -467,18 +541,20 @@ class Recorder:
             self.recorded_before += time.time() - (self.seg_start or time.time())
         self.seg_start = None
         self.state = "idle"
-        proc, seg, out = self.proc, self.cur_seg, self.final_path
-        self.proc, self.cur_seg, self.final_path = None, None, None
+        proc, seg, audio, out = self.proc, self.cur_seg, self.cur_audio, self.final_path
+        self.proc, self.cur_seg, self.cur_audio, self.final_path = None, None, None, None
         self.record_region = None
         self._update_ui()
-        threading.Thread(target=self._finish, args=(proc, seg, out),
+        threading.Thread(target=self._finish, args=(proc, seg, audio, out),
                          daemon=True).start()
 
-    def _finish(self, proc, seg, out):
+    def _finish(self, proc, seg, audio, out):
+        audio_path = audio.stop() if audio else None
         self._stop_proc(proc)
+        final_seg = self._mux_segment(seg, audio_path)
         with self.lock:
-            if seg and os.path.isfile(seg):
-                self.segments.append(seg)
+            if final_seg and os.path.isfile(final_seg):
+                self.segments.append(final_seg)
             segs = self.segments
             self.segments = []
         if not out or not segs:
@@ -497,6 +573,35 @@ class Recorder:
                     pass
         if os.path.isfile(out):
             self.last_file = out
+
+    def _mux_segment(self, video_path, audio_path=None):
+        if not video_path or not os.path.isfile(video_path):
+            return None
+        if not audio_path or not os.path.isfile(audio_path):
+            return video_path
+
+        out = os.path.join(RECORD_DIR, f".seg_{uuid.uuid4().hex}.mp4")
+        try:
+            subprocess.run([
+                self.ff, "-y",
+                "-i", video_path,
+                "-i", audio_path,
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "128k",
+                "-shortest",
+                out,
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+               creationflags=CREATE_NO_WINDOW)
+            if os.path.isfile(out):
+                return out
+            return video_path
+        finally:
+            for p in (video_path, audio_path):
+                try:
+                    if p and os.path.isfile(p) and p != out:
+                        os.remove(p)
+                except Exception:
+                    pass
 
     def _concat(self, segs, out):
         lst = os.path.join(RECORD_DIR, f".concat_{uuid.uuid4().hex}.txt")
@@ -781,7 +886,7 @@ class Recorder:
             # 同步收尾
             if self.state == "recording":
                 self.recorded_before += time.time() - (self.seg_start or time.time())
-            self._finish(self.proc, self.cur_seg, self.final_path)
+            self._finish(self.proc, self.cur_seg, self.cur_audio, self.final_path)
         try:
             self.tray.stop()
         except Exception:
