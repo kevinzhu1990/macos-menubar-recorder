@@ -19,6 +19,7 @@ import uuid
 import shutil
 import threading
 import subprocess
+import ctypes
 from datetime import datetime
 
 import tkinter as tk
@@ -38,6 +39,35 @@ HOTKEY_BAR = "ctrl+b"
 # ====================================
 
 CREATE_NO_WINDOW = 0x08000000  # 不弹 ffmpeg 控制台黑框
+MIN_REGION_SIZE = 20
+
+
+def make_dpi_aware():
+    """Keep Tk coordinates aligned with ffmpeg gdigrab physical pixels."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def virtual_screen_bounds():
+    if sys.platform == "win32":
+        user32 = ctypes.windll.user32
+        return (
+            user32.GetSystemMetrics(76),  # SM_XVIRTUALSCREEN
+            user32.GetSystemMetrics(77),  # SM_YVIRTUALSCREEN
+            user32.GetSystemMetrics(78),  # SM_CXVIRTUALSCREEN
+            user32.GetSystemMetrics(79),  # SM_CYVIRTUALSCREEN
+        )
+    return (0, 0, 0, 0)
+
+
+make_dpi_aware()
 
 
 def ffmpeg_path():
@@ -83,6 +113,213 @@ def detect_mic(ff):
         return None
 
 
+class RegionSelector:
+    def __init__(self, parent):
+        self.parent = parent
+        self.result = None
+        self.start_x = None
+        self.start_y = None
+        self.end_x = None
+        self.end_y = None
+        self.rect_id = None
+        self.size_id = None
+        self.action_window_id = None
+        self.action_frame = None
+        self.left, self.top, self.screen_w, self.screen_h = virtual_screen_bounds()
+        if self.screen_w <= 0 or self.screen_h <= 0:
+            self.left = 0
+            self.top = 0
+            self.screen_w = parent.winfo_screenwidth()
+            self.screen_h = parent.winfo_screenheight()
+
+        self.win = tk.Toplevel(parent)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        try:
+            self.win.attributes("-alpha", 0.38)
+        except Exception:
+            pass
+        self.win.configure(bg="black")
+        self.win.geometry(self._geometry())
+
+        self.canvas = tk.Canvas(
+            self.win, bg="black", cursor="crosshair", highlightthickness=0
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.create_text(
+            self.screen_w // 2, 34,
+            text="拖拽选择录屏区域，松开后确认；Esc 取消",
+            fill="white", font=("Microsoft YaHei UI", 16, "bold")
+        )
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.win.bind("<Escape>", lambda _event: self._cancel())
+        self.win.bind("<Return>", lambda _event: self._confirm())
+
+    def _signed(self, value):
+        return f"+{value}" if value >= 0 else str(value)
+
+    def _geometry(self):
+        return (
+            f"{self.screen_w}x{self.screen_h}"
+            f"{self._signed(self.left)}{self._signed(self.top)}"
+        )
+
+    def select(self):
+        self.win.lift()
+        self.win.focus_force()
+        try:
+            self.win.grab_set()
+        except Exception:
+            pass
+        self.parent.wait_window(self.win)
+        return self.result
+
+    def _on_press(self, event):
+        self.start_x = self._clamp(event.x, 0, self.screen_w)
+        self.start_y = self._clamp(event.y, 0, self.screen_h)
+        self.end_x = self.start_x
+        self.end_y = self.start_y
+        self._clear_selection()
+        self._draw_selection()
+
+    def _on_drag(self, event):
+        if self.start_x is None or self.start_y is None:
+            return
+        self.end_x = self._clamp(event.x, 0, self.screen_w)
+        self.end_y = self._clamp(event.y, 0, self.screen_h)
+        self._draw_selection()
+
+    def _on_release(self, event):
+        if self.start_x is None or self.start_y is None:
+            return
+        self.end_x = self._clamp(event.x, 0, self.screen_w)
+        self.end_y = self._clamp(event.y, 0, self.screen_h)
+        x, y, w, h = self._relative_region()
+        if w < MIN_REGION_SIZE or h < MIN_REGION_SIZE:
+            self._clear_selection()
+            self.canvas.create_text(
+                self.screen_w // 2, 72,
+                text="区域太小，请重新拖拽选择",
+                fill="#ffdd57", font=("Microsoft YaHei UI", 12, "bold"),
+                tags=("hint",)
+            )
+            return
+        self.canvas.delete("hint")
+        self._show_actions(x, y, w, h)
+
+    def _draw_selection(self):
+        x, y, w, h = self._relative_region()
+        x2 = x + w
+        y2 = y + h
+        if self.rect_id is None:
+            self.rect_id = self.canvas.create_rectangle(
+                x, y, x2, y2, outline="#00d1ff", width=3
+            )
+        else:
+            self.canvas.coords(self.rect_id, x, y, x2, y2)
+        label = f"{w} x {h}"
+        label_x = max(12, min(x + 8, self.screen_w - 120))
+        label_y = y - 28 if y > 44 else y + 8
+        if self.size_id is None:
+            self.size_id = self.canvas.create_text(
+                label_x, label_y, text=label, anchor="nw",
+                fill="white", font=("Consolas", 12, "bold")
+            )
+        else:
+            self.canvas.coords(self.size_id, label_x, label_y)
+            self.canvas.itemconfigure(self.size_id, text=label)
+
+    def _show_actions(self, x, y, w, h):
+        self._hide_actions()
+        frame = tk.Frame(
+            self.canvas, bg="#1c1c1c", bd=1,
+            highlightthickness=1, highlightbackground="#00d1ff"
+        )
+        tk.Button(frame, text="开始录屏", width=9, command=self._confirm).pack(
+            side="left", padx=(8, 4), pady=8
+        )
+        tk.Button(frame, text="重新选择", width=9, command=self._reset).pack(
+            side="left", padx=4, pady=8
+        )
+        tk.Button(frame, text="取消", width=7, command=self._cancel).pack(
+            side="left", padx=(4, 8), pady=8
+        )
+        frame.update_idletasks()
+        px = x + w + 12
+        py = y
+        if px + frame.winfo_reqwidth() > self.screen_w - 12:
+            px = x
+            py = y + h + 12
+        if py + frame.winfo_reqheight() > self.screen_h - 12:
+            py = max(12, y - frame.winfo_reqheight() - 12)
+        self.action_frame = frame
+        self.action_window_id = self.canvas.create_window(px, py, anchor="nw", window=frame)
+
+    def _relative_region(self):
+        x1 = self._clamp(min(self.start_x, self.end_x), 0, self.screen_w)
+        y1 = self._clamp(min(self.start_y, self.end_y), 0, self.screen_h)
+        x2 = self._clamp(max(self.start_x, self.end_x), 0, self.screen_w)
+        y2 = self._clamp(max(self.start_y, self.end_y), 0, self.screen_h)
+        return x1, y1, x2 - x1, y2 - y1
+
+    def _absolute_region(self):
+        x, y, w, h = self._relative_region()
+        # libx264 with yuv420p needs even dimensions.
+        w -= w % 2
+        h -= h % 2
+        if w < MIN_REGION_SIZE or h < MIN_REGION_SIZE:
+            return None
+        return int(self.left + x), int(self.top + y), int(w), int(h)
+
+    def _confirm(self):
+        region = self._absolute_region()
+        if not region:
+            return
+        self.result = region
+        self._close()
+
+    def _reset(self):
+        self.start_x = None
+        self.start_y = None
+        self.end_x = None
+        self.end_y = None
+        self._clear_selection()
+
+    def _cancel(self):
+        self.result = None
+        self._close()
+
+    def _clear_selection(self):
+        self.canvas.delete("hint")
+        if self.rect_id is not None:
+            self.canvas.delete(self.rect_id)
+            self.rect_id = None
+        if self.size_id is not None:
+            self.canvas.delete(self.size_id)
+            self.size_id = None
+        self._hide_actions()
+
+    def _hide_actions(self):
+        if self.action_window_id is not None:
+            self.canvas.delete(self.action_window_id)
+            self.action_window_id = None
+        if self.action_frame is not None:
+            self.action_frame.destroy()
+            self.action_frame = None
+
+    def _close(self):
+        try:
+            self.win.grab_release()
+        except Exception:
+            pass
+        self.win.destroy()
+
+    def _clamp(self, value, low, high):
+        return max(low, min(int(value), high))
+
+
 class Recorder:
     def __init__(self):
         os.makedirs(RECORD_DIR, exist_ok=True)
@@ -94,6 +331,7 @@ class Recorder:
         self.cur_seg = None
         self.segments = []
         self.final_path = None
+        self.record_region = None      # (x, y, width, height)
         self.recorded_before = 0.0
         self.seg_start = None
         self.lock = threading.Lock()
@@ -110,8 +348,12 @@ class Recorder:
 
     # ---------- 录制 ----------
     def _seg_cmd(self, seg, use_mic, mic_name):
-        cmd = [self.ff, "-y", "-f", "gdigrab", "-framerate", FRAMERATE,
-               "-i", "desktop"]
+        cmd = [self.ff, "-y", "-f", "gdigrab", "-framerate", FRAMERATE]
+        if self.record_region:
+            x, y, w, h = self.record_region
+            cmd += ["-offset_x", str(x), "-offset_y", str(y),
+                    "-video_size", f"{w}x{h}"]
+        cmd += ["-i", "desktop"]
         if use_mic and mic_name:
             cmd += ["-f", "dshow", "-i", "audio=" + mic_name]
         cmd += ["-c:v", "libx264", "-preset", "ultrafast",
@@ -157,6 +399,10 @@ class Recorder:
         if not self.ff:
             self._alert("未找到 ffmpeg，请先安装并加入 PATH。")
             return
+        region = RegionSelector(self.root).select()
+        if not region:
+            return
+        self.record_region = region
         self.final_path = os.path.join(
             RECORD_DIR, "录屏_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".mp4")
         self.segments = []
@@ -196,6 +442,7 @@ class Recorder:
         self.state = "idle"
         proc, seg, out = self.proc, self.cur_seg, self.final_path
         self.proc, self.cur_seg, self.final_path = None, None, None
+        self.record_region = None
         self._update_ui()
         threading.Thread(target=self._finish, args=(proc, seg, out),
                          daemon=True).start()
@@ -297,7 +544,7 @@ class Recorder:
                                  font=("Consolas", 14, "bold"))
         self.time_lbl.pack(side="left", padx=(0, 8))
 
-        self.btn_start = tk.Button(self.root, text="开始", width=5, command=self.start)
+        self.btn_start = tk.Button(self.root, text="选区录屏", width=7, command=self.start)
         self.btn_pause = tk.Button(self.root, text="暂停", width=5, command=self.pause_resume)
         self.btn_stop = tk.Button(self.root, text="结束", width=5, command=self.stop)
         self.btn_shortcuts = tk.Button(
@@ -405,7 +652,7 @@ class Recorder:
         ).pack(padx=28, pady=(0, 16))
 
         shortcuts = [
-            ("Ctrl + R", "开始 / 结束录屏"),
+            ("Ctrl + R", "选区后开始 / 结束录屏"),
             ("Ctrl + S", "框选截图并复制"),
             ("Ctrl + B", "显示 / 隐藏控制条"),
         ]
@@ -487,7 +734,7 @@ class Recorder:
             pystray.MenuItem("快捷键 / 使用说明", lambda: self._ui(self.show_shortcuts)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("显示/隐藏控制条 (Ctrl+B)", lambda: self._ui(self.toggle_bar)),
-            pystray.MenuItem("开始/结束录屏 (Ctrl+R)",
+            pystray.MenuItem("选区后开始/结束录屏 (Ctrl+R)",
                              lambda: self._ui(lambda: self.stop() if self.state != "idle" else self.start())),
             pystray.MenuItem("截图 (Ctrl+S)", lambda: self.take_screenshot()),
             pystray.MenuItem("录制麦克风", self._toggle_mic,
