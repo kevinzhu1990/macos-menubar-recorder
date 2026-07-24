@@ -492,14 +492,11 @@ class Recorder:
         except Exception:
             proc.kill()
 
-    def start(self):
+    def _start_recording(self, region):
         if self.state != "idle":
             return
         if not self.ff:
             self._alert("未找到 ffmpeg，请先安装并加入 PATH。")
-            return
-        region = RegionSelector(self.root).select()
-        if not region:
             return
         self.record_region = region
         self.final_path = os.path.join(
@@ -507,9 +504,19 @@ class Recorder:
         self.segments = []
         self.recorded_before = 0.0
         if not self._launch_segment():
+            self.record_region = None
             return
         self.state = "recording"
         self._update_ui()
+
+    def start(self):
+        region = RegionSelector(self.root).select()
+        if not region:
+            return
+        self._start_recording(region)
+
+    def start_fullscreen(self):
+        self._start_recording(None)
 
     def pause_resume(self):
         if self.state == "recording":
@@ -677,6 +684,7 @@ class Recorder:
         self.time_lbl.pack(side="left", padx=(0, 8))
 
         self.btn_start = tk.Button(self.root, text="选区录屏", width=7, command=self.start)
+        self.btn_fullscreen = tk.Button(self.root, text="全屏", width=5, command=self.start_fullscreen)
         self.btn_pause = tk.Button(self.root, text="暂停", width=5, command=self.pause_resume)
         self.btn_stop = tk.Button(self.root, text="结束", width=5, command=self.stop)
         self.btn_shortcuts = tk.Button(
@@ -684,7 +692,7 @@ class Recorder:
         )
         self.btn_collapse = tk.Button(self.root, text="▾", width=2, command=self.toggle_collapse)
         self.btn_close = tk.Button(self.root, text="✕", width=2, command=self.hide_bar)
-        for b in (self.btn_start, self.btn_pause, self.btn_stop,
+        for b in (self.btn_start, self.btn_fullscreen, self.btn_pause, self.btn_stop,
                   self.btn_shortcuts, self.btn_collapse, self.btn_close):
             b.pack(side="left", padx=2, pady=8)
 
@@ -714,7 +722,7 @@ class Recorder:
 
     def _apply_collapse(self):
         show = not self.bar_collapsed
-        for b in (self.btn_start, self.btn_pause, self.btn_stop,
+        for b in (self.btn_start, self.btn_fullscreen, self.btn_pause, self.btn_stop,
                   self.btn_shortcuts, self.btn_close):
             if show:
                 b.pack(side="left", padx=2, pady=8)
@@ -785,6 +793,7 @@ class Recorder:
 
         shortcuts = [
             ("Ctrl + R", "选区后开始 / 结束录屏"),
+            ("控制条", "点击“全屏”直接录整块桌面"),
             ("Ctrl + S", "框选截图并复制"),
             ("Ctrl + B", "显示 / 隐藏控制条"),
         ]
@@ -843,6 +852,7 @@ class Recorder:
         self.dot.itemconfigure(self.dot_id, fill=color)
         self.time_lbl.configure(text=self._fmt(self._elapsed_secs()))
         self.btn_start.configure(state=("normal" if self.state == "idle" else "disabled"))
+        self.btn_fullscreen.configure(state=("normal" if self.state == "idle" else "disabled"))
         self.btn_pause.configure(state=("disabled" if self.state == "idle" else "normal"),
                                  text=("继续" if self.state == "paused" else "暂停"))
         self.btn_stop.configure(state=("disabled" if self.state == "idle" else "normal"))
@@ -868,6 +878,8 @@ class Recorder:
             pystray.MenuItem("显示/隐藏控制条 (Ctrl+B)", lambda: self._ui(self.toggle_bar)),
             pystray.MenuItem("选区后开始/结束录屏 (Ctrl+R)",
                              lambda: self._ui(lambda: self.stop() if self.state != "idle" else self.start())),
+            pystray.MenuItem("全屏开始/结束录屏",
+                             lambda: self._ui(lambda: self.stop() if self.state != "idle" else self.start_fullscreen())),
             pystray.MenuItem("截图 (Ctrl+S)", lambda: self.take_screenshot()),
             pystray.MenuItem("录电脑内部声音", self._toggle_system_audio,
                              checked=lambda i: self.record_system_audio),
