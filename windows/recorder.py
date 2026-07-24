@@ -36,6 +36,11 @@ VIDEO_BITRATE_CRF = "23"   # libx264 质量，数字越小越清晰、文件越�
 HOTKEY_RECORD = "ctrl+r"
 HOTKEY_SHOT = "ctrl+s"
 HOTKEY_BAR = "ctrl+b"
+SYSTEM_AUDIO_KEYWORDS = (
+    "stereo mix", "立体声混音", "what u hear", "wave out mix",
+    "混音", "loopback", "virtual-audio-capturer", "cable output"
+)
+MIC_AUDIO_KEYWORDS = ("microphone", "mic", "麦克风", "麦克風")
 # ====================================
 
 CREATE_NO_WINDOW = 0x08000000  # 不弹 ffmpeg 控制台黑框
@@ -92,8 +97,8 @@ def ffmpeg_path():
     return None
 
 
-def detect_mic(ff):
-    """用 dshow 列出音频设备，返回第一个麦克风名字（找不到返回 None）。"""
+def detect_audio_devices(ff):
+    """用 dshow 列出音频设备，返回设备名列表。"""
     try:
         r = subprocess.run([ff, "-hide_banner", "-list_devices", "true",
                             "-f", "dshow", "-i", "dummy"],
@@ -101,16 +106,34 @@ def detect_mic(ff):
                            creationflags=CREATE_NO_WINDOW)
         out = (r.stderr or "")
         names = []
-        in_audio = False
         for line in out.splitlines():
             low = line.lower()
             if "(audio)" in low:
                 # 形如:  [dshow @ ...] "麦克风 (Realtek...)" (audio)
                 if '"' in line:
                     names.append(line.split('"')[1])
-        return names[0] if names else None
+        return names
     except Exception:
-        return None
+        return []
+
+
+def choose_record_audio_device(ff):
+    """优先选择系统混音/虚拟声卡，找不到再选择麦克风。"""
+    devices = detect_audio_devices(ff)
+    if not devices:
+        return None, []
+
+    for name in devices:
+        low = name.lower()
+        if any(k in low for k in SYSTEM_AUDIO_KEYWORDS):
+            return name, devices
+
+    for name in devices:
+        low = name.lower()
+        if any(k in low for k in MIC_AUDIO_KEYWORDS):
+            return name, devices
+
+    return devices[0], devices
 
 
 class RegionSelector:
@@ -365,8 +388,11 @@ class Recorder:
 
     def _launch_segment(self):
         seg = os.path.join(RECORD_DIR, f".seg_{uuid.uuid4().hex}.mp4")
-        mic = detect_mic(self.ff) if self.record_mic else None
-        cmd = self._seg_cmd(seg, self.record_mic, mic)
+        audio_name, _audio_devices = (choose_record_audio_device(self.ff)
+                                      if self.record_mic else (None, []))
+        if self.record_mic and not audio_name:
+            self._alert("未检测到可录制的声音设备，本次将只录画面。\n\n如果要录电脑播放声音，请在 Windows 声音设置里启用“立体声混音”，或安装 VB-CABLE 这类虚拟声卡后再录。")
+        cmd = self._seg_cmd(seg, self.record_mic, audio_name)
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                          stdout=subprocess.DEVNULL,
@@ -737,7 +763,7 @@ class Recorder:
             pystray.MenuItem("选区后开始/结束录屏 (Ctrl+R)",
                              lambda: self._ui(lambda: self.stop() if self.state != "idle" else self.start())),
             pystray.MenuItem("截图 (Ctrl+S)", lambda: self.take_screenshot()),
-            pystray.MenuItem("录制麦克风", self._toggle_mic,
+            pystray.MenuItem("录制声音（系统优先）", self._toggle_mic,
                              checked=lambda i: self.record_mic),
             pystray.MenuItem("打开录屏文件夹", lambda: os.startfile(RECORD_DIR)),
             pystray.MenuItem("打开截图文件夹", lambda: os.startfile(SHOT_DIR)),
