@@ -431,6 +431,7 @@ class Recorder:
         self.bar_visible = True
         self.bar_collapsed = False
         self.last_file = None
+        self.shot_in_progress = False
 
         self._build_bar()
         self._build_tray()
@@ -621,9 +622,18 @@ class Recorder:
 
     # ---------- 截图 ----------
     def take_screenshot(self):
+        if self.shot_in_progress:
+            return
+        self.shot_in_progress = True
         threading.Thread(target=self._shot_worker, daemon=True).start()
 
     def _shot_worker(self):
+        try:
+            self._shot_worker_impl()
+        finally:
+            self.shot_in_progress = False
+
+    def _shot_worker_impl(self):
         # 记录截图前剪贴板基线
         try:
             base = ImageGrab.grabclipboard()
@@ -679,12 +689,13 @@ class Recorder:
         self.btn_start = tk.Button(self.root, text="选区录屏", width=7, command=self.start)
         self.btn_pause = tk.Button(self.root, text="暂停", width=5, command=self.pause_resume)
         self.btn_stop = tk.Button(self.root, text="结束", width=5, command=self.stop)
+        self.btn_shot = tk.Button(self.root, text="截图", width=5, command=self.take_screenshot)
         self.btn_shortcuts = tk.Button(
             self.root, text="快捷键", width=6, command=self.show_shortcuts
         )
         self.btn_collapse = tk.Button(self.root, text="▾", width=2, command=self.toggle_collapse)
         self.btn_close = tk.Button(self.root, text="✕", width=2, command=self.hide_bar)
-        for b in (self.btn_start, self.btn_pause, self.btn_stop,
+        for b in (self.btn_start, self.btn_pause, self.btn_stop, self.btn_shot,
                   self.btn_shortcuts, self.btn_collapse, self.btn_close):
             b.pack(side="left", padx=2, pady=8)
 
@@ -714,7 +725,7 @@ class Recorder:
 
     def _apply_collapse(self):
         show = not self.bar_collapsed
-        for b in (self.btn_start, self.btn_pause, self.btn_stop,
+        for b in (self.btn_start, self.btn_pause, self.btn_stop, self.btn_shot,
                   self.btn_shortcuts, self.btn_close):
             if show:
                 b.pack(side="left", padx=2, pady=8)

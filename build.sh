@@ -17,7 +17,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc -O "$DIR/recorder.swift" \
   -o "$APP/Contents/MacOS/recorder" \
-  -framework AppKit
+  -framework AppKit \
+  -framework Vision
 
 # 生成 App 文件图标（.icns），若已存在则复用
 if [ ! -f "$DIR/AppIcon.icns" ]; then
