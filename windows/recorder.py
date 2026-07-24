@@ -6,7 +6,7 @@
   - 框选截图（调用 Windows 自带 ms-screenclip，自动进剪贴板）并存盘
   - 全局快捷键：Ctrl+R 录屏 / Ctrl+S 截图 / Ctrl+B 呼出控制条
   - 托盘图标 + 桌面悬浮控制条（红点+计时+开始/暂停/结束）
-  - 可选录麦克风
+  - 可选录电脑内部声音（需立体声混音或虚拟声卡）
 
 依赖：Python 3.9+，ffmpeg 在 PATH 中；pip install pillow pystray keyboard
 运行：python recorder.py
@@ -40,7 +40,6 @@ SYSTEM_AUDIO_KEYWORDS = (
     "stereo mix", "立体声混音", "what u hear", "wave out mix",
     "混音", "loopback", "virtual-audio-capturer", "cable output"
 )
-MIC_AUDIO_KEYWORDS = ("microphone", "mic", "麦克风", "麦克風")
 # ====================================
 
 CREATE_NO_WINDOW = 0x08000000  # 不弹 ffmpeg 控制台黑框
@@ -117,8 +116,8 @@ def detect_audio_devices(ff):
         return []
 
 
-def choose_record_audio_device(ff):
-    """优先选择系统混音/虚拟声卡，找不到再选择麦克风。"""
+def choose_system_audio_device(ff):
+    """只选择能录电脑内部声音的混音/虚拟声卡设备。"""
     devices = detect_audio_devices(ff)
     if not devices:
         return None, []
@@ -128,12 +127,7 @@ def choose_record_audio_device(ff):
         if any(k in low for k in SYSTEM_AUDIO_KEYWORDS):
             return name, devices
 
-    for name in devices:
-        low = name.lower()
-        if any(k in low for k in MIC_AUDIO_KEYWORDS):
-            return name, devices
-
-    return devices[0], devices
+    return None, devices
 
 
 class RegionSelector:
@@ -359,7 +353,7 @@ class Recorder:
         self.seg_start = None
         self.lock = threading.Lock()
 
-        self.record_mic = True
+        self.record_system_audio = True
         self.bar_visible = True
         self.bar_collapsed = False
         self.last_file = None
@@ -370,29 +364,36 @@ class Recorder:
         self._tick()
 
     # ---------- 录制 ----------
-    def _seg_cmd(self, seg, use_mic, mic_name):
+    def _seg_cmd(self, seg, use_audio, audio_name):
         cmd = [self.ff, "-y", "-f", "gdigrab", "-framerate", FRAMERATE]
         if self.record_region:
             x, y, w, h = self.record_region
             cmd += ["-offset_x", str(x), "-offset_y", str(y),
                     "-video_size", f"{w}x{h}"]
         cmd += ["-i", "desktop"]
-        if use_mic and mic_name:
-            cmd += ["-f", "dshow", "-i", "audio=" + mic_name]
+        if use_audio and audio_name:
+            cmd += ["-f", "dshow", "-i", "audio=" + audio_name]
         cmd += ["-c:v", "libx264", "-preset", "ultrafast",
                 "-pix_fmt", "yuv420p", "-crf", VIDEO_BITRATE_CRF]
-        if use_mic and mic_name:
+        if use_audio and audio_name:
             cmd += ["-c:a", "aac", "-b:a", "128k"]
         cmd.append(seg)
         return cmd
 
     def _launch_segment(self):
         seg = os.path.join(RECORD_DIR, f".seg_{uuid.uuid4().hex}.mp4")
-        audio_name, _audio_devices = (choose_record_audio_device(self.ff)
-                                      if self.record_mic else (None, []))
-        if self.record_mic and not audio_name:
-            self._alert("未检测到可录制的声音设备，本次将只录画面。\n\n如果要录电脑播放声音，请在 Windows 声音设置里启用“立体声混音”，或安装 VB-CABLE 这类虚拟声卡后再录。")
-        cmd = self._seg_cmd(seg, self.record_mic, audio_name)
+        audio_name, audio_devices = (choose_system_audio_device(self.ff)
+                                     if self.record_system_audio else (None, []))
+        if self.record_system_audio and not audio_name:
+            found = "、".join(audio_devices) if audio_devices else "没有检测到任何音频输入设备"
+            self._alert(
+                "没有检测到可录电脑内部声音的设备，已取消录制。\n\n"
+                "请在 Windows 声音设置里启用“立体声混音”，或安装 VB-CABLE 这类虚拟声卡，"
+                "再重新开始录屏。\n\n"
+                f"当前检测到：{found}"
+            )
+            return False
+        cmd = self._seg_cmd(seg, self.record_system_audio, audio_name)
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                          stdout=subprocess.DEVNULL,
@@ -763,8 +764,8 @@ class Recorder:
             pystray.MenuItem("选区后开始/结束录屏 (Ctrl+R)",
                              lambda: self._ui(lambda: self.stop() if self.state != "idle" else self.start())),
             pystray.MenuItem("截图 (Ctrl+S)", lambda: self.take_screenshot()),
-            pystray.MenuItem("录制声音（系统优先）", self._toggle_mic,
-                             checked=lambda i: self.record_mic),
+            pystray.MenuItem("录电脑内部声音", self._toggle_system_audio,
+                             checked=lambda i: self.record_system_audio),
             pystray.MenuItem("打开录屏文件夹", lambda: os.startfile(RECORD_DIR)),
             pystray.MenuItem("打开截图文件夹", lambda: os.startfile(SHOT_DIR)),
             pystray.MenuItem("退出", self._quit),
@@ -772,8 +773,8 @@ class Recorder:
         self.tray = pystray.Icon("录屏助手", self._tray_icon_img(), "录屏助手", menu)
         threading.Thread(target=self.tray.run, daemon=True).start()
 
-    def _toggle_mic(self, icon, item):
-        self.record_mic = not self.record_mic
+    def _toggle_system_audio(self, icon, item):
+        self.record_system_audio = not self.record_system_audio
 
     def _quit(self, icon=None, item=None):
         if self.state != "idle":
