@@ -1,6 +1,8 @@
 import AppKit
+import AVFoundation
 import Foundation
 import Carbon.HIToolbox
+import ScreenCaptureKit
 
 // ============== 可改配置 ==============
 // 录屏保存目录（自动创建）
@@ -18,22 +20,333 @@ let barKeyCode:    UInt32 = 0x0B                       // B = 呼出/隐藏控�
 let barKeyMods:    UInt32 = UInt32(controlKey)
 // ====================================
 
+final class EventLogger {
+    static let shared = EventLogger()
+    private let queue = DispatchQueue(label: "recorder.event-log")
+    private let logURL: URL
+
+    private init() {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/录屏助手", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true)
+        logURL = dir.appendingPathComponent("events.jsonl")
+    }
+
+    func write(_ event: String, details: [String: String] = [:]) {
+        queue.async {
+            var payload = details
+            payload["event"] = event
+            payload["time"] = ISO8601DateFormatter().string(from: Date())
+            guard JSONSerialization.isValidJSONObject(payload),
+                  let data = try? JSONSerialization.data(withJSONObject: payload),
+                  var line = String(data: data, encoding: .utf8) else { return }
+            line.append("\n")
+            guard let bytes = line.data(using: .utf8) else { return }
+            if !FileManager.default.fileExists(atPath: self.logURL.path) {
+                try? bytes.write(to: self.logURL, options: .atomic)
+                return
+            }
+            guard let handle = try? FileHandle(forWritingTo: self.logURL) else { return }
+            defer { try? handle.close() }
+            do {
+                try handle.seekToEnd()
+                try handle.write(contentsOf: bytes)
+            } catch {
+                return
+            }
+        }
+    }
+}
+
+final class RegionSelectionView: NSView {
+    var completion: ((CGRect?) -> Void)?
+    private var startPoint: CGPoint?
+    private var currentPoint: CGPoint?
+    private let minimumSize: CGFloat = 20
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        startPoint = convert(event.locationInWindow, from: nil)
+        currentPoint = startPoint
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        currentPoint = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        currentPoint = convert(event.locationInWindow, from: nil)
+        let rect = selectionRect()
+        guard rect.width >= minimumSize, rect.height >= minimumSize else {
+            startPoint = nil
+            currentPoint = nil
+            needsDisplay = true
+            NSSound.beep()
+            return
+        }
+        completion?(rect)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            completion?(nil)
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+
+    private func selectionRect() -> CGRect {
+        guard let a = startPoint, let b = currentPoint else { return .zero }
+        return CGRect(x: min(a.x, b.x), y: min(a.y, b.y),
+                      width: abs(a.x - b.x), height: abs(a.y - b.y))
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(calibratedWhite: 0, alpha: 0.42).setFill()
+        bounds.fill()
+
+        let title = "拖拽选择录屏区域 · Esc 取消"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.white,
+            .font: NSFont.systemFont(ofSize: 18, weight: .semibold)
+        ]
+        let size = title.size(withAttributes: attrs)
+        title.draw(at: CGPoint(x: bounds.midX - size.width / 2,
+                               y: bounds.maxY - 54), withAttributes: attrs)
+
+        let rect = selectionRect()
+        guard !rect.isEmpty else { return }
+        NSGraphicsContext.current?.saveGraphicsState()
+        NSColor.clear.setFill()
+        rect.fill(using: .copy)
+        NSColor.systemCyan.setStroke()
+        let border = NSBezierPath(rect: rect)
+        border.lineWidth = 3
+        border.stroke()
+        NSGraphicsContext.current?.restoreGraphicsState()
+
+        let label = "\(Int(rect.width)) × \(Int(rect.height))"
+        let labelAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.white,
+            .backgroundColor: NSColor(calibratedWhite: 0.08, alpha: 0.82),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+        ]
+        label.draw(at: CGPoint(x: rect.minX + 8,
+                               y: max(rect.minY - 24, 8)), withAttributes: labelAttrs)
+    }
+}
+
+final class RegionSelectionPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
+final class RegionSelector {
+    func select(on screen: NSScreen) -> CGRect? {
+        let panel = RegionSelectionPanel(
+            contentRect: screen.frame, styleMask: [.borderless],
+            backing: .buffered, defer: false)
+        panel.level = .screenSaver
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let view = RegionSelectionView(frame: CGRect(origin: .zero, size: screen.frame.size))
+        panel.contentView = view
+
+        var result: CGRect?
+        view.completion = { localRect in
+            if let localRect {
+                result = localRect.offsetBy(dx: screen.frame.minX, dy: screen.frame.minY)
+                NSApp.stopModal(withCode: .OK)
+            } else {
+                NSApp.stopModal(withCode: .cancel)
+            }
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(view)
+        _ = NSApp.runModal(for: panel)
+        panel.orderOut(nil)
+        return result
+    }
+}
+
+@available(macOS 15.0, *)
+final class NativeCaptureSegment: NSObject, SCRecordingOutputDelegate, SCStreamDelegate {
+    let path: String
+    private var stream: SCStream?
+    private var recordingOutput: SCRecordingOutput?
+    private var finishHandler: ((Result<String, Error>) -> Void)?
+    private let finishLock = NSLock()
+    private var finished = false
+    private var pendingResult: Result<String, Error>?
+
+    init(path: String) {
+        self.path = path
+    }
+
+    func start(
+        displayID: CGDirectDisplayID,
+        captureRect: CGRect?,
+        pixelSize: RecordingPixelSize,
+        systemAudio: Bool,
+        microphone: Bool,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        SCShareableContent.getExcludingDesktopWindows(
+            false, onScreenWindowsOnly: true
+        ) { [weak self] content, error in
+            guard let self else { return }
+            if let error {
+                DispatchQueue.main.async { completion(.failure(error)) }
+                return
+            }
+            guard let display = content?.displays.first(where: {
+                $0.displayID == displayID
+            }) else {
+                let e = NSError(domain: "录屏助手", code: 1,
+                                userInfo: [NSLocalizedDescriptionKey: "未找到要录制的显示器"])
+                DispatchQueue.main.async { completion(.failure(e)) }
+                return
+            }
+
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let config = SCStreamConfiguration()
+            config.width = pixelSize.width
+            config.height = pixelSize.height
+            if let captureRect { config.sourceRect = captureRect }
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+            config.queueDepth = 6
+            config.pixelFormat = kCVPixelFormatType_32BGRA
+            config.showsCursor = true
+            config.showMouseClicks = true
+            config.capturesAudio = systemAudio
+            config.excludesCurrentProcessAudio = true
+            config.sampleRate = 48_000
+            config.channelCount = 2
+            config.captureMicrophone = microphone
+
+            let outputConfig = SCRecordingOutputConfiguration()
+            outputConfig.outputURL = URL(fileURLWithPath: self.path)
+            outputConfig.outputFileType = .mp4
+            outputConfig.videoCodecType = .h264
+            let output = SCRecordingOutput(
+                configuration: outputConfig, delegate: self)
+            let stream = SCStream(filter: filter, configuration: config, delegate: self)
+            do {
+                try stream.addRecordingOutput(output)
+            } catch {
+                DispatchQueue.main.async { completion(.failure(error)) }
+                return
+            }
+            self.recordingOutput = output
+            self.stream = stream
+            stream.startCapture { error in
+                DispatchQueue.main.async {
+                    if let error {
+                        completion(.failure(error))
+                    } else {
+                        completion(.success(()))
+                    }
+                }
+            }
+        }
+    }
+
+    func stop(completion: @escaping (Result<String, Error>) -> Void) {
+        finishLock.lock()
+        finishHandler = completion
+        let pending = pendingResult
+        pendingResult = nil
+        finishLock.unlock()
+        if let pending {
+            finish(pending)
+            return
+        }
+        guard let stream else {
+            finish(.success(path))
+            return
+        }
+        stream.stopCapture { [weak self] error in
+            guard let self else { return }
+            if let error { self.finish(.failure(error)) }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self, !self.finished else { return }
+                if FileManager.default.fileExists(atPath: self.path) {
+                    self.finish(.success(self.path))
+                } else {
+                    let e = NSError(
+                        domain: "录屏助手", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "录屏文件未生成"])
+                    self.finish(.failure(e))
+                }
+            }
+        }
+    }
+
+    func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
+        finish(.success(path))
+    }
+
+    func recordingOutput(
+        _ recordingOutput: SCRecordingOutput,
+        didFailWithError error: Error
+    ) {
+        finish(.failure(error))
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        finish(.failure(error))
+    }
+
+    private func finish(_ result: Result<String, Error>) {
+        finishLock.lock()
+        guard !finished else {
+            finishLock.unlock()
+            return
+        }
+        guard let handler = finishHandler else {
+            pendingResult = result
+            finishLock.unlock()
+            return
+        }
+        finished = true
+        finishHandler = nil
+        finishLock.unlock()
+        handler(result)
+    }
+}
+
 final class Recorder: NSObject, NSApplicationDelegate {
     static var shared: Recorder?
 
     enum RecState { case idle, recording, paused }
     var state: RecState = .idle
     var isRecording: Bool { state != .idle }   // 兼容旧判断
+    var isStarting = false
 
     var statusItem: NSStatusItem!
-    var process: Process?            // 当前片段的 ffmpeg 进程
+    var process: Process?            // macOS 13/14 兼容路径的 screencapture 进程
+    var nativeSegment: AnyObject?    // macOS 15+ 的 NativeCaptureSegment
     var currentSegPath: String?      // 当前片段临时文件
-    var segments: [String] = []      // 已录完的片段（仅在 recQ 上读写）
+    var currentSegmentIndex = 0
+    var nextSegmentIndex = 0
+    var segments: [(index: Int, path: String)] = [] // 仅在 recQ 上读写
+    let pendingSegments = DispatchGroup()
     var finalPath: String?           // 最终输出文件
     var recordedBefore: TimeInterval = 0  // 已完成片段累计时长（不含暂停）
     var segStart: Date?              // 当前片段开始时刻
-    var devInput: String?            // ffmpeg 输入串 "screen[:mic]"
     var segUseMic = false            // 本次录制是否含麦克风（整段固定，保证 concat 一致）
+    var segUseSystemAudio = false
+    var selectedScreenID: CGDirectDisplayID?
+    var selectedScreenFrame: CGRect?
+    var selectedScreenScale: CGFloat = 1
+    var selectedCaptureRect: CGRect?
     let recQ = DispatchQueue(label: "rec.segments")  // 串行处理片段收尾/合并
     var timer: Timer?
     var lastFile: String?
@@ -41,6 +354,11 @@ final class Recorder: NSObject, NSApplicationDelegate {
     var recordMic: Bool {
         get { UserDefaults.standard.object(forKey: "recordMic") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "recordMic") }
+    }
+    // macOS 15+ 由 ScreenCaptureKit 原生录制电脑内部声音。
+    var recordSystemAudio: Bool {
+        get { UserDefaults.standard.object(forKey: "recordSystemAudio") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "recordSystemAudio") }
     }
     // 是否显示桌面控制条（红点+计时+按钮）。默认开。
     var showBar: Bool {
@@ -51,6 +369,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
     var bar: NSPanel?
     var barView: TimerView?
     var btnStart: NSButton?
+    var btnFullscreen: NSButton?
     var btnPause: NSButton?
     var btnStop: NSButton?
     var btnCollapse: NSButton?
@@ -60,7 +379,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
         get { UserDefaults.standard.bool(forKey: "barCollapsed") }
         set { UserDefaults.standard.set(newValue, forKey: "barCollapsed") }
     }
-    let barWidthFull: CGFloat = 340
+    let barWidthFull: CGFloat = 410
     let barWidthMin: CGFloat = 122
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -108,8 +427,12 @@ final class Recorder: NSObject, NSApplicationDelegate {
 
     func showMenu() {
         let menu = NSMenu()
-        menu.addItem(withTitle: isRecording ? "结束录制  ⌃R" : "开始录制  ⌃R",
+        menu.addItem(withTitle: isRecording ? "结束录制  ⌃R" : "选区录屏  ⌃R",
                      action: #selector(toggle), keyEquivalent: "")
+        if !isRecording {
+            menu.addItem(withTitle: "全屏录制",
+                         action: #selector(startFullscreen), keyEquivalent: "")
+        }
         if isRecording {
             menu.addItem(withTitle: state == .paused ? "继续录制" : "暂停录制",
                          action: #selector(pauseResume), keyEquivalent: "")
@@ -121,6 +444,10 @@ final class Recorder: NSObject, NSApplicationDelegate {
                                  action: #selector(toggleMic), keyEquivalent: "")
         micItem.state = recordMic ? .on : .off
         menu.addItem(micItem)
+        let audioItem = NSMenuItem(title: "录制电脑内部声音（macOS 15+）",
+                                   action: #selector(toggleSystemAudio), keyEquivalent: "")
+        audioItem.state = recordSystemAudio ? .on : .off
+        menu.addItem(audioItem)
         let barItem = NSMenuItem(title: "显示/隐藏控制条  ⌃B",
                                  action: #selector(toggleBar), keyEquivalent: "")
         barItem.state = showBar ? .on : .off
@@ -141,21 +468,89 @@ final class Recorder: NSObject, NSApplicationDelegate {
     }
 
     // ---- 录屏 ----
-    @objc func toggle() { isRecording ? stop() : start() }
+    @objc func toggle() {
+        if isRecording {
+            stop()
+        } else if !isStarting {
+            start()
+        }
+    }
 
     @objc func toggleMic() { recordMic.toggle() }
+    @objc func toggleSystemAudio() {
+        if #available(macOS 15.0, *) {
+            recordSystemAudio.toggle()
+        } else {
+            recordSystemAudio = false
+            alert("当前系统不支持原生内录",
+                  "电脑内部声音需要 macOS 15 或更高版本。当前系统仍可录制画面和麦克风。")
+        }
+    }
 
-    // 开始（idle → recording）
+    // 选区开始（idle → recording）
     @objc func start() {
-        guard state == .idle else { return }
+        guard state == .idle, !isStarting else { return }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) })
+            ?? NSScreen.main
+        guard let screen,
+              let selection = RegionSelector().select(on: screen),
+              let rect = RecordingGeometry.captureRect(
+                selectionInGlobalPoints: selection,
+                screenFrame: screen.frame,
+                minimumSize: 20) else { return }
+        beginRecording(on: screen, captureRect: rect)
+    }
+
+    @objc func startFullscreen() {
+        guard state == .idle, !isStarting, let screen = NSScreen.main else { return }
+        beginRecording(on: screen, captureRect: nil)
+    }
+
+    func beginRecording(on screen: NSScreen, captureRect: CGRect?) {
+        guard let displayID = displayID(for: screen) else {
+            alert("无法开始录制", "未能识别当前显示器，请重新连接显示器后再试。")
+            return
+        }
+        selectedScreenID = displayID
+        selectedScreenFrame = screen.frame
+        selectedScreenScale = screen.backingScaleFactor
+        selectedCaptureRect = captureRect
         segUseMic = recordMic
-        finalPath = "\(recordDir)/录屏_\(timestamp()).mov"
+        if #available(macOS 15.0, *) {
+            segUseSystemAudio = recordSystemAudio
+            finalPath = "\(recordDir)/录屏_\(timestamp()).mp4"
+        } else {
+            segUseSystemAudio = false
+            finalPath = "\(recordDir)/录屏_\(timestamp()).mov"
+        }
         recordedBefore = 0
-        recQ.async { [weak self] in self?.segments = [] }
-        guard launchSegment() else { return }
-        state = .recording
-        startTimer()
+        nextSegmentIndex = 0
+        recQ.sync { segments = [] }
+        isStarting = true
         updateUI()
+        launchSegment { [weak self] result in
+            guard let self else { return }
+            self.isStarting = false
+            switch result {
+            case .success:
+                self.state = .recording
+                self.startTimer()
+                EventLogger.shared.write("recording_started", details: [
+                    "mode": captureRect == nil ? "fullscreen" : "region",
+                    "system_audio": String(self.segUseSystemAudio),
+                    "microphone": String(self.segUseMic)
+                ])
+            case .failure(let error):
+                self.clearRecordingSelection()
+                self.finalPath = nil
+                EventLogger.shared.write("recording_start_failed",
+                                         details: ["error": error.localizedDescription])
+                self.alert("无法开始录制",
+                           "\(error.localizedDescription)\n\n请检查“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”。")
+            }
+            self.updateUI()
+        }
     }
 
     // 暂停 / 继续
@@ -168,9 +563,23 @@ final class Recorder: NSObject, NSApplicationDelegate {
             stopCurrentSegment()      // 结束当前片段（后台收尾）
             updateUI()
         case .paused:
-            _ = launchSegment()
-            state = .recording
+            guard !isStarting else { return }
+            isStarting = true
             updateUI()
+            launchSegment { [weak self] result in
+                guard let self else { return }
+                self.isStarting = false
+                switch result {
+                case .success:
+                    self.state = .recording
+                    EventLogger.shared.write("recording_resumed")
+                case .failure(let error):
+                    EventLogger.shared.write("recording_resume_failed",
+                                             details: ["error": error.localizedDescription])
+                    self.alert("无法继续录制", error.localizedDescription)
+                }
+                self.updateUI()
+            }
         case .idle:
             break
         }
@@ -178,32 +587,100 @@ final class Recorder: NSObject, NSApplicationDelegate {
 
     // 结束（recording/paused → idle）：收尾 + 合并所有片段
     @objc func stop() {
-        guard state != .idle else { return }
+        guard state != .idle, !isStarting else { return }
         if state == .recording {
             recordedBefore += Date().timeIntervalSince(segStart ?? Date())
         }
         segStart = nil
         state = .idle
+        isStarting = true // 合并完成前不允许开始下一次，避免片段串台
         stopTimer()
         updateUI()
-        let p = process; let sp = currentSegPath; let out = finalPath
-        process = nil; currentSegPath = nil; finalPath = nil
-        // 在串行队列收尾（FIFO 保证之前暂停的片段都已入列），再合并
-        recQ.async { [weak self] in
-            guard let self = self else { return }
-            if let p = p { kill(p.processIdentifier, SIGINT); p.waitUntilExit() }
-            if let sp = sp, FileManager.default.fileExists(atPath: sp) { self.segments.append(sp) }
-            let all = self.segments; self.segments = []
-            self.finalize(segments: all, to: out)
+        let out = finalPath
+        finalPath = nil
+        stopCurrentSegment()
+        pendingSegments.notify(queue: recQ) { [weak self] in
+            guard let self else { return }
+            let all = self.segments.sorted { $0.index < $1.index }.map(\.path)
+            self.segments = []
+            let completedOutput = self.finalize(segments: all, to: out)
+            DispatchQueue.main.async {
+                self.isStarting = false
+                self.clearRecordingSelection()
+                self.updateUI()
+                if let completedOutput {
+                    self.lastFile = completedOutput
+                    EventLogger.shared.write("recording_finished", details: [
+                        "output": completedOutput,
+                        "segments": String(all.count)
+                    ])
+                }
+            }
         }
     }
 
-    // 启动一个录制片段：用系统 screencapture 全屏录制（直接用本 App 的录屏权限）
-    @discardableResult
-    func launchSegment() -> Bool {
+    func displayID(for screen: NSScreen) -> CGDirectDisplayID? {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        return (screen.deviceDescription[key] as? NSNumber)?.uint32Value
+    }
+
+    func clearRecordingSelection() {
+        selectedScreenID = nil
+        selectedScreenFrame = nil
+        selectedCaptureRect = nil
+        nativeSegment = nil
+        process = nil
+        currentSegPath = nil
+    }
+
+    // 启动一个录制片段。macOS 15+ 用 ScreenCaptureKit 原生内录；
+    // macOS 13/14 保留 screencapture 兼容路径（画面 + 麦克风）。
+    func launchSegment(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let displayID = selectedScreenID, let screenFrame = selectedScreenFrame else {
+            let error = NSError(domain: "录屏助手", code: 3,
+                                userInfo: [NSLocalizedDescriptionKey: "录制区域已经失效"])
+            completion(.failure(error))
+            return
+        }
+        let index = nextSegmentIndex
+        nextSegmentIndex += 1
+        currentSegmentIndex = index
+
+        if #available(macOS 15.0, *) {
+            let seg = "\(recordDir)/.seg_\(UUID().uuidString).mp4"
+            let rect = selectedCaptureRect ?? CGRect(
+                origin: .zero, size: screenFrame.size)
+            let pixels = RecordingGeometry.pixelSize(
+                captureRect: rect, scaleFactor: selectedScreenScale)
+            let capture = NativeCaptureSegment(path: seg)
+            nativeSegment = capture
+            currentSegPath = seg
+            capture.start(
+                displayID: displayID,
+                captureRect: selectedCaptureRect,
+                pixelSize: pixels,
+                systemAudio: segUseSystemAudio,
+                microphone: segUseMic,
+                completion: { [weak self] result in
+                    guard let self else { return }
+                    if case .success = result {
+                        self.segStart = Date()
+                    } else {
+                        self.nativeSegment = nil
+                        self.currentSegPath = nil
+                        try? FileManager.default.removeItem(atPath: seg)
+                    }
+                    completion(result)
+                })
+            return
+        }
+
         let seg = "\(recordDir)/.seg_\(UUID().uuidString).mov"
         var args = ["-v", "-x"]            // -v 录视频  -x 不播放提示音
         if segUseMic { args.append("-g") } // -g 同时录麦克风
+        if let rect = selectedCaptureRect {
+            args.append("-R\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width)),\(Int(rect.height))")
+        }
         args.append(seg)
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
@@ -217,39 +694,88 @@ final class Recorder: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 guard self.state == .recording, self.process === proc else { return }
                 let sp = self.currentSegPath
+                let index = self.currentSegmentIndex
                 self.recordedBefore += Date().timeIntervalSince(self.segStart ?? Date())
                 self.recQ.async {
                     if let sp = sp, FileManager.default.fileExists(atPath: sp) {
-                        self.segments.append(sp)
+                        self.segments.append((index, sp))
                     }
                 }
                 self.process = nil
                 self.currentSegPath = nil
-                self.launchSegment()   // 接力下一段
+                self.launchSegment { result in
+                    if case .failure(let error) = result {
+                        self.stop()
+                        self.alert("录制意外中断", error.localizedDescription)
+                    }
+                }
             }
         }
-        do { try p.run() } catch { return false }
+        do {
+            try p.run()
+        } catch {
+            completion(.failure(error))
+            return
+        }
         process = p
         currentSegPath = seg
         segStart = Date()
-        return true
+        completion(.success(()))
     }
 
-    // 结束当前片段（后台等待 ffmpeg 写完文件尾后入列）
+    // 结束当前片段并按创建顺序入列。
     func stopCurrentSegment() {
-        let p = process; let sp = currentSegPath
-        process = nil; currentSegPath = nil
+        let index = currentSegmentIndex
+        let sp = currentSegPath
+        currentSegPath = nil
+
+        if #available(macOS 15.0, *),
+           let capture = nativeSegment as? NativeCaptureSegment {
+            nativeSegment = nil
+            pendingSegments.enter()
+            capture.stop { [weak self] result in
+                guard let self else { return }
+                self.recQ.async {
+                    switch result {
+                    case .success(let path):
+                        if FileManager.default.fileExists(atPath: path) {
+                            self.segments.append((index, path))
+                        }
+                    case .failure(let error):
+                        EventLogger.shared.write("segment_finish_failed",
+                                                 details: ["error": error.localizedDescription])
+                    }
+                    self.pendingSegments.leave()
+                }
+            }
+            return
+        }
+
+        let p = process
+        process = nil
+        guard p != nil || sp != nil else { return }
+        pendingSegments.enter()
         recQ.async { [weak self] in
             if let p = p { kill(p.processIdentifier, SIGINT); p.waitUntilExit() }
-            if let sp = sp, FileManager.default.fileExists(atPath: sp) { self?.segments.append(sp) }
+            if let sp = sp, FileManager.default.fileExists(atPath: sp) {
+                self?.segments.append((index, sp))
+            }
+            self?.pendingSegments.leave()
         }
     }
 
     // 合并片段为最终文件（单段直接改名，多段用 ffmpeg concat 无损拼接）
-    func finalize(segments segs: [String], to out: String?) {
-        guard let out = out, !segs.isEmpty else { return }
+    @discardableResult
+    func finalize(segments segs: [String], to out: String?) -> String? {
+        guard let out = out, !segs.isEmpty else { return nil }
+        try? FileManager.default.removeItem(atPath: out)
         if segs.count == 1 {
-            try? FileManager.default.moveItem(atPath: segs[0], toPath: out)
+            do {
+                try FileManager.default.moveItem(atPath: segs[0], toPath: out)
+            } catch {
+                EventLogger.shared.write("recording_move_failed",
+                                         details: ["error": error.localizedDescription])
+            }
         } else if let ff = ffmpegPath() {
             let list = NSTemporaryDirectory() + "concat_\(UUID().uuidString).txt"
             let body = segs.map { "file '\($0)'" }.joined(separator: "\n")
@@ -262,11 +788,38 @@ final class Recorder: NSObject, NSApplicationDelegate {
             p.standardOutput = FileHandle.nullDevice
             try? p.run(); p.waitUntilExit()
             try? FileManager.default.removeItem(atPath: list)
-            for s in segs { try? FileManager.default.removeItem(atPath: s) }
+            if p.terminationStatus == 0,
+               FileManager.default.fileExists(atPath: out) {
+                for s in segs { try? FileManager.default.removeItem(atPath: s) }
+            }
         }
+
+        if FileManager.default.fileExists(atPath: out) {
+            return out
+        }
+
+        let base = (out as NSString).deletingPathExtension
+        let ext = (segs.first! as NSString).pathExtension
+        var preserved: [String] = []
+        for (offset, source) in segs.enumerated()
+            where FileManager.default.fileExists(atPath: source) {
+            let visible = "\(base)_第\(offset + 1)段.\(ext)"
+            try? FileManager.default.removeItem(atPath: visible)
+            do {
+                try FileManager.default.moveItem(atPath: source, toPath: visible)
+                preserved.append(visible)
+            } catch {
+                preserved.append(source)
+            }
+        }
+        EventLogger.shared.write("recording_merge_failed", details: [
+            "preserved_segments": preserved.joined(separator: "|")
+        ])
         DispatchQueue.main.async { [weak self] in
-            if FileManager.default.fileExists(atPath: out) { self?.lastFile = out }
+            self?.alert("录屏片段未能合并",
+                        "请确认已安装 ffmpeg（brew install ffmpeg）。片段已经保留，没有删除：\n\(preserved.joined(separator: "\n"))")
         }
+        return preserved.first
     }
 
     // 找 ffmpeg（GUI 启动的 App 没有 shell 的 PATH，必须用绝对路径）
@@ -430,12 +983,14 @@ final class Recorder: NSObject, NSApplicationDelegate {
         w.contentView = v
         barView = v
 
-        btnStart = makeBtn("开始", #selector(start))
+        btnStart = makeBtn("选区", #selector(start))
+        btnFullscreen = makeBtn("全屏", #selector(startFullscreen))
         btnPause = makeBtn("暂停", #selector(pauseResume))
         btnStop  = makeBtn("结束", #selector(stop))
         btnCollapse = makeBtn("▾", #selector(toggleCollapse))   // 缩小/展开
         btnClose = makeBtn("✕", #selector(hideBar))             // 隐藏
-        for b in [btnStart!, btnPause!, btnStop!, btnCollapse!, btnClose!] { v.addSubview(b) }
+        for b in [btnStart!, btnFullscreen!, btnPause!, btnStop!,
+                  btnCollapse!, btnClose!] { v.addSubview(b) }
 
         bar = w
         applyCollapse(barCollapsed)   // 按记住的状态排布
@@ -458,11 +1013,13 @@ final class Recorder: NSObject, NSApplicationDelegate {
         // 保持右上角不动地改变宽度
         w.setFrame(NSRect(x: f.maxX - newW, y: f.origin.y, width: newW, height: f.height),
                    display: true)
-        btnStart?.frame = NSRect(x: 92, y: 10, width: 52, height: 30)
-        btnPause?.frame = NSRect(x: 148, y: 10, width: 52, height: 30)
-        btnStop?.frame  = NSRect(x: 204, y: 10, width: 52, height: 30)
+        btnStart?.frame = NSRect(x: 92, y: 10, width: 56, height: 30)
+        btnFullscreen?.frame = NSRect(x: 152, y: 10, width: 56, height: 30)
+        btnPause?.frame = NSRect(x: 212, y: 10, width: 52, height: 30)
+        btnStop?.frame  = NSRect(x: 268, y: 10, width: 52, height: 30)
         btnClose?.frame = NSRect(x: barWidthFull - 38, y: 13, width: 28, height: 24)
         btnStart?.isHidden = c
+        btnFullscreen?.isHidden = c
         btnPause?.isHidden = c
         btnStop?.isHidden = c
         btnClose?.isHidden = c
@@ -508,10 +1065,11 @@ final class Recorder: NSObject, NSApplicationDelegate {
         v.state = state
         v.text = state == .idle ? "00:00" : elapsed()
         v.needsDisplay = true
-        btnStart?.isEnabled = (state == .idle)
-        btnPause?.isEnabled = (state != .idle)
+        btnStart?.isEnabled = (state == .idle && !isStarting)
+        btnFullscreen?.isEnabled = (state == .idle && !isStarting)
+        btnPause?.isEnabled = (state != .idle && !isStarting)
         btnPause?.title = (state == .paused) ? "继续" : "暂停"
-        btnStop?.isEnabled = (state != .idle)
+        btnStop?.isEnabled = (state != .idle && !isStarting)
     }
 
     func timestamp() -> String {
@@ -529,21 +1087,25 @@ final class Recorder: NSObject, NSApplicationDelegate {
     }
     @objc func quit() {
         if state != .idle {
-            if state == .recording {
-                recordedBefore += Date().timeIntervalSince(segStart ?? Date())
-            }
-            state = .idle
-            let p = process; let sp = currentSegPath; let out = finalPath
-            process = nil; currentSegPath = nil; finalPath = nil
-            // 同步收尾并合并（recQ 串行，先处理完之前暂停的片段）
-            recQ.sync {
-                if let p = p { kill(p.processIdentifier, SIGINT); p.waitUntilExit() }
-                if let sp = sp, FileManager.default.fileExists(atPath: sp) { segments.append(sp) }
-                let all = segments; segments = []
-                finalize(segments: all, to: out)
-            }
+            stop()
+            terminateWhenFinalized(deadline: Date().addingTimeInterval(20))
+            return
+        }
+        if isStarting {
+            alert("正在处理录屏", "请等待当前录屏开始或文件合并完成后再退出。")
+            return
         }
         NSApp.terminate(nil)
+    }
+
+    func terminateWhenFinalized(deadline: Date) {
+        if !isStarting || Date() >= deadline {
+            NSApp.terminate(nil)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.terminateWhenFinalized(deadline: deadline)
+        }
     }
 }
 
@@ -572,10 +1134,15 @@ final class TimerView: NSView {
     }
 }
 
-let app = NSApplication.shared
-let delegate = Recorder()
-app.delegate = delegate
-app.run()
+@main
+enum RecorderApp {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = Recorder()
+        app.delegate = delegate
+        app.run()
+    }
+}
 
 // ===== 常用虚拟键码对照（改快捷键时用）=====
 // A=0x00 S=0x01 D=0x02 F=0x03 H=0x04 G=0x05 Z=0x06 X=0x07 C=0x08 V=0x09

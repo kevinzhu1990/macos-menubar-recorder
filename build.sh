@@ -15,9 +15,13 @@ echo "正在编译..."
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-swiftc -O "$DIR/recorder.swift" \
+swiftc -O \
+  -target "$(uname -m)-apple-macosx13.0" \
+  "$DIR/RecordingCore.swift" "$DIR/recorder.swift" \
   -o "$APP/Contents/MacOS/recorder" \
-  -framework AppKit
+  -framework AppKit \
+  -framework AVFoundation \
+  -framework ScreenCaptureKit
 
 # 生成 App 文件图标（.icns），若已存在则复用
 if [ ! -f "$DIR/AppIcon.icns" ]; then
@@ -40,12 +44,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key>      <string>recorder</string>
   <key>CFBundleIconFile</key>        <string>AppIcon</string>
   <key>CFBundlePackageType</key>     <string>APPL</string>
-  <key>CFBundleVersion</key>         <string>1.0</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key>         <string>2.0</string>
+  <key>CFBundleShortVersionString</key><string>2.0</string>
   <key>LSMinimumSystemVersion</key>  <string>13.0</string>
   <!-- 菜单栏专用：不显示 Dock 图标 -->
   <key>LSUIElement</key>             <true/>
-  <key>NSMicrophoneUsageDescription</key><string>录屏时录制麦克风声音</string>
+  <key>NSMicrophoneUsageDescription</key><string>用于在录屏时同步录制麦克风声音</string>
 </dict>
 </plist>
 PLIST
