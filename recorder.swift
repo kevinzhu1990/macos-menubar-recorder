@@ -53,6 +53,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
     var btnStart: NSButton?
     var btnPause: NSButton?
     var btnStop: NSButton?
+    var btnShortcuts: NSButton?
     var btnCollapse: NSButton?
     var btnClose: NSButton?
     // 控制条是否收起（只剩红点+计时）。记住状态。
@@ -60,7 +61,7 @@ final class Recorder: NSObject, NSApplicationDelegate {
         get { UserDefaults.standard.bool(forKey: "barCollapsed") }
         set { UserDefaults.standard.set(newValue, forKey: "barCollapsed") }
     }
-    let barWidthFull: CGFloat = 340
+    let barWidthFull: CGFloat = 420
     let barWidthMin: CGFloat = 122
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -108,6 +109,9 @@ final class Recorder: NSObject, NSApplicationDelegate {
 
     func showMenu() {
         let menu = NSMenu()
+        menu.addItem(withTitle: "快捷键 / 使用说明",
+                     action: #selector(showShortcuts), keyEquivalent: "")
+        menu.addItem(.separator())
         menu.addItem(withTitle: isRecording ? "结束录制  ⌃R" : "开始录制  ⌃R",
                      action: #selector(toggle), keyEquivalent: "")
         if isRecording {
@@ -138,6 +142,22 @@ final class Recorder: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
         statusItem.button?.performClick(nil) // 展开菜单
         statusItem.menu = nil                // 立刻清空，保证下次左键仍是开始/停止
+    }
+
+    @objc func showShortcuts() {
+        let alert = NSAlert()
+        alert.messageText = "录屏助手快捷键"
+        alert.informativeText = """
+        ⌃R（Control + R）    开始 / 结束录屏
+        ⌃S（Control + S）    框选截图并复制
+        ⌃B（Control + B）    显示 / 隐藏控制条
+
+        也可以直接使用悬浮控制条或菜单栏里的功能。
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "知道了")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     // ---- 录屏 ----
@@ -433,9 +453,11 @@ final class Recorder: NSObject, NSApplicationDelegate {
         btnStart = makeBtn("开始", #selector(start))
         btnPause = makeBtn("暂停", #selector(pauseResume))
         btnStop  = makeBtn("结束", #selector(stop))
+        btnShortcuts = makeBtn("快捷键", #selector(showShortcuts))
         btnCollapse = makeBtn("▾", #selector(toggleCollapse))   // 缩小/展开
         btnClose = makeBtn("✕", #selector(hideBar))             // 隐藏
-        for b in [btnStart!, btnPause!, btnStop!, btnCollapse!, btnClose!] { v.addSubview(b) }
+        for b in [btnStart!, btnPause!, btnStop!, btnShortcuts!,
+                  btnCollapse!, btnClose!] { v.addSubview(b) }
 
         bar = w
         applyCollapse(barCollapsed)   // 按记住的状态排布
@@ -461,10 +483,12 @@ final class Recorder: NSObject, NSApplicationDelegate {
         btnStart?.frame = NSRect(x: 92, y: 10, width: 52, height: 30)
         btnPause?.frame = NSRect(x: 148, y: 10, width: 52, height: 30)
         btnStop?.frame  = NSRect(x: 204, y: 10, width: 52, height: 30)
+        btnShortcuts?.frame = NSRect(x: 260, y: 10, width: 68, height: 30)
         btnClose?.frame = NSRect(x: barWidthFull - 38, y: 13, width: 28, height: 24)
         btnStart?.isHidden = c
         btnPause?.isHidden = c
         btnStop?.isHidden = c
+        btnShortcuts?.isHidden = c
         btnClose?.isHidden = c
         // 折叠按钮：折叠时贴在计时后面，展开时在右侧
         btnCollapse?.frame = c ? NSRect(x: 84, y: 13, width: 30, height: 24)
