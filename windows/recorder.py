@@ -16,11 +16,13 @@ import os
 import sys
 import time
 import uuid
+import json
 import shutil
 import threading
 import subprocess
 import ctypes
 import wave
+import urllib.request
 from datetime import datetime
 
 import tkinter as tk
@@ -35,8 +37,11 @@ SHOT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "截图")
 FRAMERATE = "30"
 VIDEO_BITRATE_CRF = "23"   # libx264 质量，数字越小越清晰、文件越大
 HOTKEY_RECORD = "ctrl+r"
+HOTKEY_PAUSE = "ctrl+p"
 HOTKEY_SHOT = "ctrl+s"
 HOTKEY_BAR = "ctrl+b"
+CONFIG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ScreenRecorder")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "settings.json")
 SYSTEM_AUDIO_KEYWORDS = (
     "stereo mix", "立体声混音", "what u hear", "wave out mix",
     "混音", "loopback", "virtual-audio-capturer", "cable output"
@@ -45,6 +50,15 @@ SYSTEM_AUDIO_KEYWORDS = (
 
 CREATE_NO_WINDOW = 0x08000000  # 不弹 ffmpeg 控制台黑框
 MIN_REGION_SIZE = 20
+APP_VERSION = "1.2.2"
+UPDATE_VERSION_URL = (
+    "https://github.com/kevinzhu1990/macos-menubar-recorder/"
+    "releases/download/win-latest/version.json"
+)
+UPDATE_DOWNLOAD_URL = (
+    "https://github.com/kevinzhu1990/macos-menubar-recorder/"
+    "releases/download/win-latest/ScreenRecorderSetup.exe"
+)
 
 
 def make_dpi_aware():
@@ -226,7 +240,7 @@ class RegionSelector:
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
         try:
-            self.win.attributes("-alpha", 0.38)
+            self.win.attributes("-alpha", 0.52)
         except Exception:
             pass
         self.win.configure(bg="black")
@@ -238,7 +252,7 @@ class RegionSelector:
         self.canvas.pack(fill="both", expand=True)
         self.canvas.create_text(
             self.screen_w // 2, 34,
-            text="拖拽选择录屏区域，松开后确认；Esc 取消",
+            text="拖拽选择录屏区域，松开后点击“开始录屏”；Esc 取消",
             fill="white", font=("Microsoft YaHei UI", 16, "bold")
         )
         self.canvas.bind("<ButtonPress-1>", self._on_press)
@@ -324,17 +338,36 @@ class RegionSelector:
     def _show_actions(self, x, y, w, h):
         self._hide_actions()
         frame = tk.Frame(
-            self.canvas, bg="#1c1c1c", bd=1,
-            highlightthickness=1, highlightbackground="#00d1ff"
+            self.canvas, bg="#f1f9ff", bd=0,
+            highlightthickness=2, highlightbackground="#28c79a"
         )
-        tk.Button(frame, text="开始录屏", width=9, command=self._confirm).pack(
-            side="left", padx=(8, 4), pady=8
+        tk.Label(
+            frame, text="区域已选好", fg="#142033", bg="#f1f9ff",
+            font=("Microsoft YaHei UI", 9, "bold")
+        ).pack(side="left", padx=(10, 6))
+        tk.Button(
+            frame, text="开始录屏", width=10, command=self._confirm,
+            fg="white", bg="#28c79a", activeforeground="white",
+            activebackground="#20b78d", relief="flat", bd=0,
+            cursor="hand2", font=("Microsoft YaHei UI", 10, "bold")
+        ).pack(
+            side="left", padx=4, pady=9, ipady=3
         )
-        tk.Button(frame, text="重新选择", width=9, command=self._reset).pack(
-            side="left", padx=4, pady=8
+        tk.Button(
+            frame, text="重新选择", width=8, command=self._reset,
+            fg="#4353c7", bg="#e5edff", activebackground="#d8e2ff",
+            relief="flat", bd=0, cursor="hand2",
+            font=("Microsoft YaHei UI", 9, "bold")
+        ).pack(
+            side="left", padx=4, pady=9, ipady=3
         )
-        tk.Button(frame, text="取消", width=7, command=self._cancel).pack(
-            side="left", padx=(4, 8), pady=8
+        tk.Button(
+            frame, text="取消", width=6, command=self._cancel,
+            fg="#d83b4d", bg="#ffe5e8", activebackground="#ffd6db",
+            relief="flat", bd=0, cursor="hand2",
+            font=("Microsoft YaHei UI", 9, "bold")
+        ).pack(
+            side="left", padx=(4, 10), pady=9, ipady=3
         )
         frame.update_idletasks()
         px = x + w + 12
@@ -410,10 +443,70 @@ class RegionSelector:
         return max(low, min(int(value), high))
 
 
+class RoundedButton(tk.Canvas):
+    """Small flat button drawn on a canvas so the floating bar can use rounded controls."""
+
+    def __init__(self, parent, text, command, width, bg, fg="#142033",
+                 hover_bg=None, disabled_bg="#e7eef4", disabled_fg="#9aa8b5"):
+        super().__init__(parent, width=width, height=32, bg=parent.cget("bg"),
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.command = command
+        self.label = text
+        self.normal_bg = bg
+        self.hover_bg = hover_bg or bg
+        self.fg = fg
+        self.disabled_bg = disabled_bg
+        self.disabled_fg = disabled_fg
+        self.button_state = "normal"
+        self.bind("<Enter>", lambda _e: self._draw(True))
+        self.bind("<Leave>", lambda _e: self._draw(False))
+        self.bind("<ButtonRelease-1>", self._click)
+        self._draw(False)
+
+    def _round_rect(self, x1, y1, x2, y2, radius, **kwargs):
+        points = [
+            x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
+            x2, y2 - radius, x2, y2, x2 - radius, y2,
+            x1 + radius, y2, x1, y2, x1, y2 - radius,
+            x1, y1 + radius, x1, y1,
+        ]
+        return self.create_polygon(points, smooth=True, splinesteps=24, **kwargs)
+
+    def _draw(self, hovering=False):
+        self.delete("all")
+        disabled = self.button_state == "disabled"
+        fill = self.disabled_bg if disabled else (self.hover_bg if hovering else self.normal_bg)
+        text_color = self.disabled_fg if disabled else self.fg
+        self._round_rect(1, 1, int(self.cget("width")) - 1, 31, 10,
+                         fill=fill, outline="")
+        self.create_text(int(self.cget("width")) // 2, 16, text=self.label,
+                         fill=text_color, font=("Microsoft YaHei UI", 9, "bold"))
+        super().configure(cursor="arrow" if disabled else "hand2")
+
+    def _click(self, _event):
+        if self.button_state == "normal" and self.command:
+            self.command()
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            kwargs.update(cnf)
+        if "text" in kwargs:
+            self.label = kwargs.pop("text")
+        if "state" in kwargs:
+            self.button_state = kwargs.pop("state")
+        if kwargs:
+            super().configure(**kwargs)
+        self._draw(False)
+
+    config = configure
+
+
 class Recorder:
     def __init__(self):
         os.makedirs(RECORD_DIR, exist_ok=True)
         os.makedirs(SHOT_DIR, exist_ok=True)
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        self._cleanup_stale_recording_files()
         self.ff = ffmpeg_path()
 
         self.state = "idle"            # idle / recording / paused
@@ -427,7 +520,15 @@ class Recorder:
         self.seg_start = None
         self.lock = threading.Lock()
 
+        self.framerate = "30"
+        self.video_crf = "23"
+        self.draw_mouse = True
+        self.countdown_seconds = 3
+        self.auto_stop_minutes = 0
         self.record_system_audio = True
+        self.bar_width = 390
+        self.bar_height = 96
+        self._load_settings()
         self.bar_visible = True
         self.bar_collapsed = False
         self.last_file = None
@@ -437,16 +538,54 @@ class Recorder:
         self._register_hotkeys()
         self._tick()
 
+    def _load_settings(self):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        self.framerate = str(data.get("framerate", self.framerate))
+        self.video_crf = str(data.get("video_crf", self.video_crf))
+        self.draw_mouse = bool(data.get("draw_mouse", self.draw_mouse))
+        self.countdown_seconds = int(data.get("countdown_seconds", self.countdown_seconds))
+        self.auto_stop_minutes = int(data.get("auto_stop_minutes", self.auto_stop_minutes))
+        self.record_system_audio = bool(
+            data.get("record_system_audio", self.record_system_audio)
+        )
+        self.bar_width = max(350, int(data.get("bar_width", self.bar_width)))
+        self.bar_height = max(90, int(data.get("bar_height", self.bar_height)))
+
+    def _save_settings(self):
+        data = {
+            "framerate": self.framerate,
+            "video_crf": self.video_crf,
+            "draw_mouse": self.draw_mouse,
+            "countdown_seconds": self.countdown_seconds,
+            "auto_stop_minutes": self.auto_stop_minutes,
+            "record_system_audio": self.record_system_audio,
+            "bar_width": self.bar_width,
+            "bar_height": self.bar_height,
+        }
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
     # ---------- 录制 ----------
     def _seg_cmd(self, seg):
-        cmd = [self.ff, "-y", "-f", "gdigrab", "-framerate", FRAMERATE]
+        cmd = [
+            self.ff, "-y", "-f", "gdigrab",
+            "-draw_mouse", "1" if self.draw_mouse else "0",
+            "-framerate", self.framerate,
+        ]
         if self.record_region:
             x, y, w, h = self.record_region
             cmd += ["-offset_x", str(x), "-offset_y", str(y),
                     "-video_size", f"{w}x{h}"]
         cmd += ["-i", "desktop"]
         cmd += ["-c:v", "libx264", "-preset", "ultrafast",
-                "-pix_fmt", "yuv420p", "-crf", VIDEO_BITRATE_CRF]
+                "-pix_fmt", "yuv420p", "-crf", self.video_crf]
         cmd.append(seg)
         return cmd
 
@@ -513,10 +652,45 @@ class Recorder:
         region = RegionSelector(self.root).select()
         if not region:
             return
-        self._start_recording(region)
+        self._start_after_countdown(region)
 
     def start_fullscreen(self):
-        self._start_recording(None)
+        self._start_after_countdown(None)
+
+    def _start_after_countdown(self, region):
+        seconds = max(0, int(self.countdown_seconds))
+        if seconds == 0:
+            self._start_recording(region)
+            return
+
+        self.state = "countdown"
+        self._update_ui()
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="#5965f3")
+        label = tk.Label(
+            win, text=str(seconds), fg="white", bg="#5965f3",
+            font=("Microsoft YaHei UI", 34, "bold"), padx=26, pady=12
+        )
+        label.pack()
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() - win.winfo_width()) // 2
+        y = (win.winfo_screenheight() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+
+        def tick(value):
+            if not win.winfo_exists():
+                return
+            if value <= 0:
+                win.destroy()
+                self.state = "idle"
+                self._start_recording(region)
+                return
+            label.configure(text=str(value))
+            win.after(1000, lambda: tick(value - 1))
+
+        tick(seconds)
 
     def pause_resume(self):
         if self.state == "recording":
@@ -580,6 +754,7 @@ class Recorder:
                     pass
         if os.path.isfile(out):
             self.last_file = out
+            self._ui(self._refresh_recordings)
 
     def _mux_segment(self, video_path, audio_path=None):
         if not video_path or not os.path.isfile(video_path):
@@ -588,27 +763,60 @@ class Recorder:
             return video_path
 
         out = os.path.join(RECORD_DIR, f".seg_{uuid.uuid4().hex}.mp4")
+        mux_succeeded = False
         try:
-            subprocess.run([
+            result = subprocess.run([
                 self.ff, "-y",
                 "-i", video_path,
                 "-i", audio_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "128k",
+                "-af", "apad",
                 "-shortest",
                 out,
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                creationflags=CREATE_NO_WINDOW)
-            if os.path.isfile(out):
+            mux_succeeded = (
+                result.returncode == 0
+                and os.path.isfile(out)
+                and os.path.getsize(out) > 0
+            )
+            if mux_succeeded:
                 return out
+            try:
+                if os.path.isfile(out):
+                    os.remove(out)
+            except Exception:
+                pass
             return video_path
         finally:
-            for p in (video_path, audio_path):
-                try:
-                    if p and os.path.isfile(p) and p != out:
-                        os.remove(p)
-                except Exception:
-                    pass
+            if mux_succeeded:
+                for p in (video_path, audio_path):
+                    try:
+                        if p and os.path.isfile(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
+
+    def _cleanup_stale_recording_files(self):
+        """Remove abandoned recording intermediates from previous crashes."""
+        prefixes = (".audio_", ".video_", ".seg_", ".concat_")
+        cutoff = time.time() - 24 * 60 * 60
+        try:
+            names = os.listdir(RECORD_DIR)
+        except Exception:
+            return
+        for name in names:
+            if not name.startswith(prefixes):
+                continue
+            path = os.path.join(RECORD_DIR, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except Exception:
+                pass
 
     def _concat(self, segs, out):
         lst = os.path.join(RECORD_DIR, f".concat_{uuid.uuid4().hex}.txt")
@@ -668,39 +876,68 @@ class Recorder:
         self.root.title("录屏助手")
         self.root.overrideredirect(True)          # 无边框
         self.root.attributes("-topmost", True)     # 始终置顶
-        self.root.configure(bg="#1c1c1c")
+        self.root.configure(bg="#b9dff0")
         try:
-            self.root.attributes("-alpha", 0.96)
+            self.root.attributes("-alpha", 0.98)
         except Exception:
             pass
 
-        self.dot = tk.Canvas(self.root, width=16, height=16, bg="#1c1c1c",
-                             highlightthickness=0)
-        self.dot.pack(side="left", padx=(12, 4), pady=12)
-        self.dot_id = self.dot.create_oval(3, 3, 13, 13, fill="#ff3b30", outline="")
+        self.root.minsize(350, 90)
+        self.root.geometry(f"{self.bar_width}x{self.bar_height}")
 
-        self.time_lbl = tk.Label(self.root, text="00:00", fg="white", bg="#1c1c1c",
-                                 font=("Consolas", 14, "bold"))
-        self.time_lbl.pack(side="left", padx=(0, 8))
+        self.bar_frame = tk.Frame(self.root, bg="#f1f9ff", padx=8, pady=6)
+        self.bar_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        self.top_row = tk.Frame(self.bar_frame, bg="#f1f9ff")
+        self.top_row.pack(fill="x")
+        self.bottom_row = tk.Frame(self.bar_frame, bg="#f1f9ff")
+        self.bottom_row.pack(anchor="center", pady=(5, 0))
 
-        self.btn_start = tk.Button(self.root, text="选区录屏", width=7, command=self.start)
-        self.btn_fullscreen = tk.Button(self.root, text="全屏", width=5, command=self.start_fullscreen)
-        self.btn_pause = tk.Button(self.root, text="暂停", width=5, command=self.pause_resume)
-        self.btn_stop = tk.Button(self.root, text="结束", width=5, command=self.stop)
-        self.btn_shortcuts = tk.Button(
-            self.root, text="快捷键", width=6, command=self.show_shortcuts
+        self.title_lbl = tk.Label(
+            self.top_row, text="录屏助手", fg="#142033", bg="#f1f9ff",
+            font=("Microsoft YaHei UI", 10, "bold")
         )
-        self.btn_collapse = tk.Button(self.root, text="▾", width=2, command=self.toggle_collapse)
-        self.btn_close = tk.Button(self.root, text="✕", width=2, command=self.hide_bar)
+        self.title_lbl.pack(side="left", padx=(2, 8))
+
+        self.status_frame = tk.Frame(self.top_row, bg="#e3f5f7", padx=7, pady=3)
+        self.status_frame.pack(side="left", padx=(0, 8))
+        self.dot = tk.Canvas(self.status_frame, width=12, height=18, bg="#e3f5f7",
+                             highlightthickness=0)
+        self.dot.pack(side="left", padx=(0, 3))
+        self.dot_id = self.dot.create_oval(3, 6, 9, 12, fill="#28c79a", outline="")
+
+        self.time_lbl = tk.Label(self.status_frame, text="00:00", fg="#142033", bg="#e3f5f7",
+                                 font=("Consolas", 11, "bold"))
+        self.time_lbl.pack(side="left")
+
+        self.btn_start = RoundedButton(
+            self.bottom_row, "选区录屏", self.start, 70, "#28c79a", "white", "#20b78d")
+        self.btn_fullscreen = RoundedButton(
+            self.bottom_row, "全屏", self.start_fullscreen, 48, "#5965f3", "white", "#4853df")
+        self.btn_pause = RoundedButton(
+            self.bottom_row, "暂停", self.pause_resume, 48, "#dcecf7", "#334155", "#cfe4f2")
+        self.btn_stop = RoundedButton(
+            self.bottom_row, "结束", self.stop, 48, "#ffe5e8", "#d83b4d", "#ffd6db")
+        self.btn_shot = RoundedButton(
+            self.bottom_row, "截图", self.take_screenshot, 48, "#e3f5f7", "#147f86", "#d5eff1")
+        self.btn_shortcuts = RoundedButton(
+            self.bottom_row, "工具", self.show_tools, 48, "#e5edff", "#4353c7", "#d8e2ff")
+        self.btn_collapse = RoundedButton(
+            self.top_row, "▾", self.toggle_collapse, 32, "#e7f1f7", "#526171", "#dceaf3")
+        self.btn_close = RoundedButton(
+            self.top_row, "×", self.hide_bar, 32, "#e7f1f7", "#526171", "#ffdfe3")
         for b in (self.btn_start, self.btn_fullscreen, self.btn_pause, self.btn_stop,
-                  self.btn_shortcuts, self.btn_collapse, self.btn_close):
-            b.pack(side="left", padx=2, pady=8)
+                  self.btn_shot, self.btn_shortcuts):
+            b.pack(side="left", padx=2)
+        self.btn_close.pack(side="right", padx=(2, 0))
+        self.btn_collapse.pack(side="right", padx=2)
 
         # 拖动移动窗口
-        for w in (self.root, self.dot, self.time_lbl):
+        for w in (self.bar_frame, self.top_row, self.title_lbl, self.status_frame,
+                  self.dot, self.time_lbl):
             w.bind("<Button-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
 
+        self._add_resize_handles()
         self.root.update_idletasks()
         self._position_bar()
         self._apply_collapse()
@@ -714,6 +951,60 @@ class Recorder:
         y = self.root.winfo_y() + e.y - self._dy
         self.root.geometry(f"+{x}+{y}")
 
+    def _add_resize_handles(self):
+        specs = [
+            ("n", "size_ns", {"x": 7, "y": 0, "relwidth": 1, "width": -14, "height": 6}),
+            ("s", "size_ns", {"x": 7, "rely": 1, "y": -6, "relwidth": 1, "width": -14, "height": 6}),
+            ("w", "size_we", {"x": 0, "y": 7, "width": 6, "relheight": 1, "height": -14}),
+            ("e", "size_we", {"relx": 1, "x": -6, "y": 7, "width": 6, "relheight": 1, "height": -14}),
+            ("nw", "size_nw_se", {"x": 0, "y": 0, "width": 8, "height": 8}),
+            ("ne", "size_ne_sw", {"relx": 1, "x": -8, "y": 0, "width": 8, "height": 8}),
+            ("sw", "size_ne_sw", {"x": 0, "rely": 1, "y": -8, "width": 8, "height": 8}),
+            ("se", "size_nw_se", {"relx": 1, "x": -8, "rely": 1, "y": -8, "width": 8, "height": 8}),
+        ]
+        self.resize_handles = []
+        for edge, cursor, place_args in specs:
+            handle = tk.Frame(self.root, bg="#b9dff0", cursor=cursor)
+            handle.place(**place_args)
+            handle.bind("<ButtonPress-1>", lambda e, side=edge: self._resize_start(e, side))
+            handle.bind("<B1-Motion>", self._resize_move)
+            handle.bind("<ButtonRelease-1>", self._resize_end)
+            self.resize_handles.append(handle)
+
+    def _resize_start(self, event, edge):
+        self._resize_edge = edge
+        self._resize_origin = (
+            event.x_root, event.y_root,
+            self.root.winfo_x(), self.root.winfo_y(),
+            self.root.winfo_width(), self.root.winfo_height(),
+        )
+
+    def _resize_move(self, event):
+        edge = getattr(self, "_resize_edge", "")
+        sx, sy, x, y, width, height = self._resize_origin
+        dx, dy = event.x_root - sx, event.y_root - sy
+        min_width, min_height = 350, 90
+        if "e" in edge:
+            width = max(min_width, width + dx)
+        if "s" in edge:
+            height = max(min_height, height + dy)
+        if "w" in edge:
+            new_width = max(min_width, width - dx)
+            x += width - new_width
+            width = new_width
+        if "n" in edge:
+            new_height = max(min_height, height - dy)
+            y += height - new_height
+            height = new_height
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _resize_end(self, _event):
+        if not self.bar_collapsed:
+            self.bar_width = self.root.winfo_width()
+            self.bar_height = self.root.winfo_height()
+            self._save_settings()
+        self._resize_edge = ""
+
     def _position_bar(self):
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
@@ -722,16 +1013,22 @@ class Recorder:
 
     def _apply_collapse(self):
         show = not self.bar_collapsed
-        for b in (self.btn_start, self.btn_fullscreen, self.btn_pause, self.btn_stop,
-                  self.btn_shortcuts, self.btn_close):
-            if show:
-                b.pack(side="left", padx=2, pady=8)
-            else:
-                b.pack_forget()
+        if show:
+            self.root.minsize(350, 90)
+            self.bottom_row.pack(anchor="center", pady=(5, 0))
+            self.root.geometry(f"{self.bar_width}x{self.bar_height}")
+        else:
+            self.root.minsize(220, 50)
+            self.bottom_row.pack_forget()
+            self.root.geometry("240x52")
         self.btn_collapse.configure(text="▸" if self.bar_collapsed else "▾")
         self._position_bar()
 
     def toggle_collapse(self):
+        if not self.bar_collapsed:
+            self.bar_width = self.root.winfo_width()
+            self.bar_height = self.root.winfo_height()
+            self._save_settings()
         self.bar_collapsed = not self.bar_collapsed
         self._apply_collapse()
 
@@ -753,6 +1050,294 @@ class Recorder:
         else:
             self.show_bar()
 
+    def show_tools(self):
+        win = getattr(self, "tools_win", None)
+        if win and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            self._refresh_recordings()
+            return
+
+        win = tk.Toplevel(self.root)
+        self.tools_win = win
+        win.title("录屏助手")
+        win.configure(bg="#eef8ff")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+
+        def close():
+            self.tools_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+
+        header = tk.Frame(win, bg="#eef8ff")
+        header.pack(fill="x", padx=24, pady=(20, 12))
+        tk.Label(
+            header, text="录屏助手", fg="#142033", bg="#eef8ff",
+            font=("Microsoft YaHei UI", 18, "bold")
+        ).pack(side="left")
+        tk.Label(
+            header, text=f"版本 {APP_VERSION} · 录制、截图与文件管理",
+            fg="#607387", bg="#eef8ff",
+            font=("Microsoft YaHei UI", 9)
+        ).pack(side="left", padx=(10, 0), pady=(7, 0))
+
+        actions = tk.Frame(win, bg="#eef8ff")
+        actions.pack(fill="x", padx=20, pady=(0, 14))
+
+        def action_button(text, command, color, column):
+            button = tk.Button(
+                actions, text=text, command=command, fg="white", bg=color,
+                activebackground=color, activeforeground="white",
+                relief="flat", bd=0, cursor="hand2",
+                font=("Microsoft YaHei UI", 10, "bold"), padx=18, pady=10
+            )
+            button.grid(row=0, column=column, padx=4, sticky="ew")
+            actions.grid_columnconfigure(column, weight=1)
+
+        action_button("选区录屏", lambda: (close(), self.start()), "#28c79a", 0)
+        action_button("全屏录屏", lambda: (close(), self.start_fullscreen()), "#5965f3", 1)
+        action_button("截图", self.take_screenshot, "#2aa9d6", 2)
+        action_button("录制设置", self.show_settings, "#718096", 3)
+
+        file_bar = tk.Frame(win, bg="#ffffff", highlightthickness=1,
+                            highlightbackground="#d7ebf6")
+        file_bar.pack(fill="x", padx=24, pady=(0, 10))
+        tk.Label(
+            file_bar, text="最近录屏", fg="#142033", bg="#ffffff",
+            font=("Microsoft YaHei UI", 11, "bold")
+        ).pack(side="left", padx=14, pady=10)
+        tk.Button(
+            file_bar, text="打开录屏文件夹", command=lambda: os.startfile(RECORD_DIR),
+            fg="#4353c7", bg="#ffffff", activebackground="#eef4ff",
+            relief="flat", bd=0, cursor="hand2",
+            font=("Microsoft YaHei UI", 9, "bold")
+        ).pack(side="right", padx=8)
+        tk.Button(
+            file_bar, text="打开截图文件夹", command=lambda: os.startfile(SHOT_DIR),
+            fg="#147f86", bg="#ffffff", activebackground="#e8f7f8",
+            relief="flat", bd=0, cursor="hand2",
+            font=("Microsoft YaHei UI", 9, "bold")
+        ).pack(side="right", padx=8)
+
+        list_frame = tk.Frame(win, bg="#ffffff", highlightthickness=1,
+                              highlightbackground="#d7ebf6")
+        list_frame.pack(fill="both", expand=True, padx=24, pady=(0, 12))
+        self.recordings_list = tk.Listbox(
+            list_frame, height=10, activestyle="none", selectmode="browse",
+            bg="#ffffff", fg="#263548", selectbackground="#dce8ff",
+            selectforeground="#263548", relief="flat", bd=0,
+            font=("Microsoft YaHei UI", 9)
+        )
+        self.recordings_list.pack(fill="both", expand=True, padx=10, pady=10)
+        self.recordings_list.bind("<Double-Button-1>", lambda _e: self._open_selected_recording())
+
+        bottom = tk.Frame(win, bg="#eef8ff")
+        bottom.pack(fill="x", padx=24, pady=(0, 18))
+        tk.Button(
+            bottom, text="播放选中", command=self._open_selected_recording,
+            fg="white", bg="#5965f3", activebackground="#4853df",
+            activeforeground="white", relief="flat", bd=0, cursor="hand2",
+            font=("Microsoft YaHei UI", 9, "bold"), padx=16, pady=7
+        ).pack(side="left")
+        tk.Button(
+            bottom, text="快捷键说明", command=self.show_shortcuts,
+            fg="#4353c7", bg="#e5edff", activebackground="#d8e2ff",
+            relief="flat", bd=0, cursor="hand2",
+            font=("Microsoft YaHei UI", 9, "bold"), padx=16, pady=7
+        ).pack(side="left", padx=8)
+        tk.Button(
+            bottom, text="检查更新", command=self.check_for_updates,
+            fg="#147f86", bg="#e3f5f7", activebackground="#d5eff1",
+            relief="flat", bd=0, cursor="hand2",
+            font=("Microsoft YaHei UI", 9, "bold"), padx=16, pady=7
+        ).pack(side="left")
+
+        self._refresh_recordings()
+        win.update_idletasks()
+        x = max(0, (win.winfo_screenwidth() - win.winfo_width()) // 2)
+        y = max(0, (win.winfo_screenheight() - win.winfo_height()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.focus_force()
+
+    def _refresh_recordings(self):
+        box = getattr(self, "recordings_list", None)
+        if not box or not box.winfo_exists():
+            return
+        box.delete(0, "end")
+        try:
+            files = [
+                os.path.join(RECORD_DIR, name)
+                for name in os.listdir(RECORD_DIR)
+                if name.lower().endswith(".mp4") and not name.startswith(".")
+            ]
+            files.sort(key=os.path.getmtime, reverse=True)
+        except Exception:
+            files = []
+        self.recent_recordings = files[:30]
+        if not self.recent_recordings:
+            box.insert("end", "暂无录屏文件")
+            return
+        for path in self.recent_recordings:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            stamp = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%m-%d %H:%M")
+            box.insert("end", f"{stamp}    {size_mb:.1f} MB    {os.path.basename(path)}")
+
+    def _open_selected_recording(self):
+        box = getattr(self, "recordings_list", None)
+        files = getattr(self, "recent_recordings", [])
+        if not box or not files:
+            return
+        selected = box.curselection()
+        if not selected or selected[0] >= len(files):
+            return
+        try:
+            os.startfile(files[selected[0]])
+        except Exception as e:
+            self._alert(f"无法打开录屏：{e}")
+
+    def show_settings(self):
+        win = getattr(self, "settings_win", None)
+        if win and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        self.settings_win = win
+        win.title("录制设置")
+        win.configure(bg="#eef8ff")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+
+        def close():
+            self.settings_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+
+        tk.Label(
+            win, text="录制设置", fg="#142033", bg="#eef8ff",
+            font=("Microsoft YaHei UI", 16, "bold")
+        ).pack(anchor="w", padx=24, pady=(20, 14))
+
+        panel = tk.Frame(win, bg="#ffffff", highlightthickness=1,
+                         highlightbackground="#d7ebf6")
+        panel.pack(fill="both", padx=24)
+
+        fps_var = tk.StringVar(value=self.framerate)
+        quality_by_crf = {"18": "超清", "23": "高清（推荐）", "28": "流畅"}
+        crf_by_quality = {value: key for key, value in quality_by_crf.items()}
+        quality_var = tk.StringVar(value=quality_by_crf.get(self.video_crf, "高清（推荐）"))
+        countdown_var = tk.StringVar(value=str(self.countdown_seconds))
+        auto_stop_var = tk.StringVar(value=str(self.auto_stop_minutes))
+        audio_var = tk.BooleanVar(value=self.record_system_audio)
+        mouse_var = tk.BooleanVar(value=self.draw_mouse)
+
+        def option_row(row, title, variable, values, suffix=""):
+            tk.Label(
+                panel, text=title, fg="#263548", bg="#ffffff",
+                font=("Microsoft YaHei UI", 10)
+            ).grid(row=row, column=0, sticky="w", padx=16, pady=10)
+            menu = tk.OptionMenu(panel, variable, *values)
+            menu.configure(
+                width=14, fg="#263548", bg="#edf5fb", activebackground="#dcecf7",
+                relief="flat", bd=0, highlightthickness=0,
+                font=("Microsoft YaHei UI", 9)
+            )
+            menu.grid(row=row, column=1, sticky="e", padx=(20, 4), pady=6)
+            tk.Label(
+                panel, text=suffix, fg="#607387", bg="#ffffff",
+                font=("Microsoft YaHei UI", 9)
+            ).grid(row=row, column=2, sticky="w", padx=(0, 16))
+
+        option_row(0, "画质", quality_var, ["高清（推荐）", "超清", "流畅"])
+        option_row(1, "帧率", fps_var, ["30", "60"], "帧/秒")
+        option_row(2, "开始倒计时", countdown_var, ["0", "3", "5"], "秒")
+        option_row(3, "自动结束", auto_stop_var, ["0", "10", "30", "60"], "分钟（0 为不限）")
+
+        check_style = {
+            "fg": "#263548", "bg": "#ffffff", "activebackground": "#ffffff",
+            "selectcolor": "#ffffff", "font": ("Microsoft YaHei UI", 10),
+            "bd": 0, "highlightthickness": 0,
+        }
+        tk.Checkbutton(
+            panel, text="录制电脑内部声音", variable=audio_var, **check_style
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(10, 4))
+        tk.Checkbutton(
+            panel, text="录制鼠标指针", variable=mouse_var, **check_style
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 12))
+
+        def save():
+            self.framerate = fps_var.get()
+            self.video_crf = crf_by_quality.get(quality_var.get(), "23")
+            self.countdown_seconds = int(countdown_var.get())
+            self.auto_stop_minutes = int(auto_stop_var.get())
+            self.record_system_audio = bool(audio_var.get())
+            self.draw_mouse = bool(mouse_var.get())
+            self._save_settings()
+            close()
+
+        tk.Button(
+            win, text="保存设置", command=save, fg="white", bg="#28c79a",
+            activebackground="#20b78d", activeforeground="white",
+            relief="flat", bd=0, cursor="hand2",
+            font=("Microsoft YaHei UI", 9, "bold"), padx=24, pady=8
+        ).pack(pady=18)
+
+        win.update_idletasks()
+        x = max(0, (win.winfo_screenwidth() - win.winfo_width()) // 2)
+        y = max(0, (win.winfo_screenheight() - win.winfo_height()) // 3)
+        win.geometry(f"+{x}+{y}")
+        win.focus_force()
+
+    def check_for_updates(self):
+        threading.Thread(target=self._check_update_worker, daemon=True).start()
+
+    def _check_update_worker(self):
+        try:
+            request = urllib.request.Request(
+                UPDATE_VERSION_URL,
+                headers={"User-Agent": f"ScreenRecorder/{APP_VERSION}"},
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                metadata = json.load(response)
+            latest = str(metadata.get("version") or "")
+            if not latest:
+                raise ValueError("服务器未提供版本号")
+            download_url = metadata.get("download_url") or UPDATE_DOWNLOAD_URL
+            self._ui(
+                lambda version=latest, url=download_url:
+                self._show_update_result(version, url)
+            )
+        except Exception as exc:
+            message = str(exc)
+            self._ui(lambda text=message: self._alert(f"检查更新失败：{text}"))
+
+    def _show_update_result(self, latest, download_url=UPDATE_DOWNLOAD_URL):
+        from tkinter import messagebox
+
+        def version_tuple(value):
+            return tuple(int(part) for part in value.split("."))
+
+        if version_tuple(latest) > version_tuple(APP_VERSION):
+            download = messagebox.askyesno(
+                "发现新版本",
+                f"发现录屏助手 {latest}。\n"
+                f"当前版本：{APP_VERSION}\n\n"
+                "是否打开新版安装包下载？",
+            )
+            if download:
+                os.startfile(download_url)
+        else:
+            messagebox.showinfo(
+                "检查更新",
+                f"当前已是最新版。\n\n版本：{APP_VERSION}",
+            )
+
     def show_shortcuts(self):
         """显示快捷键和基础操作说明；重复点击时复用现有窗口。"""
         win = getattr(self, "shortcut_win", None)
@@ -765,7 +1350,7 @@ class Recorder:
         win = tk.Toplevel(self.root)
         self.shortcut_win = win
         win.title("快捷键 · 录屏助手")
-        win.configure(bg="#1c1c1c")
+        win.configure(bg="#eef8ff")
         win.resizable(False, False)
         win.attributes("-topmost", True)
 
@@ -781,35 +1366,38 @@ class Recorder:
         win.bind("<Escape>", lambda _event: close())
 
         tk.Label(
-            win, text="录屏助手快捷键", fg="white", bg="#1c1c1c",
+            win, text="录屏助手快捷键", fg="#142033", bg="#eef8ff",
             font=("Microsoft YaHei UI", 16, "bold")
         ).pack(padx=28, pady=(22, 4))
 
         tk.Label(
-            win, text="记住这 3 个组合键，就能完成日常操作",
-            fg="#a8a8a8", bg="#1c1c1c",
+            win, text="记住这 4 个组合键，就能完成日常操作",
+            fg="#607387", bg="#eef8ff",
             font=("Microsoft YaHei UI", 9)
         ).pack(padx=28, pady=(0, 16))
 
         shortcuts = [
             ("Ctrl + R", "选区后开始 / 结束录屏"),
+            ("Ctrl + P", "暂停 / 继续当前录屏"),
             ("控制条", "点击“全屏”直接录整块桌面"),
             ("Ctrl + S", "框选截图并复制"),
             ("Ctrl + B", "显示 / 隐藏控制条"),
+            ("Enter / Esc", "确认选区 / 取消选区"),
         ]
         for key, action in shortcuts:
-            row = tk.Frame(win, bg="#292929")
+            row = tk.Frame(win, bg="#ffffff", highlightthickness=1,
+                           highlightbackground="#d7ebf6")
             row.pack(fill="x", padx=22, pady=4)
 
             tk.Label(
                 row, text=key, width=11, anchor="center",
-                fg="white", bg="#3a3a3a",
+                fg="#ffffff", bg="#5965f3",
                 font=("Consolas", 11, "bold")
             ).pack(side="left", padx=8, pady=9)
 
             tk.Label(
                 row, text=action, anchor="w",
-                fg="white", bg="#292929",
+                fg="#263548", bg="#ffffff",
                 font=("Microsoft YaHei UI", 10)
             ).pack(side="left", padx=(8, 16), pady=9)
 
@@ -817,13 +1405,16 @@ class Recorder:
             win,
             text="也可以直接使用悬浮控制条或右下角托盘菜单。\n"
                  "快捷键无响应时，请尝试以管理员身份运行。",
-            justify="left", fg="#b8b8b8", bg="#1c1c1c",
+            justify="left", fg="#607387", bg="#eef8ff",
             font=("Microsoft YaHei UI", 9)
         ).pack(fill="x", padx=28, pady=(14, 12))
 
         tk.Button(
             win, text="知道了", width=12, command=close,
-            font=("Microsoft YaHei UI", 9)
+            fg="white", bg="#28c79a", activebackground="#20b78d",
+            activeforeground="white", relief="flat", bd=0,
+            font=("Microsoft YaHei UI", 9, "bold"), cursor="hand2",
+            padx=10, pady=6
         ).pack(pady=(0, 20))
 
         win.update_idletasks()
@@ -845,17 +1436,30 @@ class Recorder:
 
     def _tick(self):
         self._update_ui()
+        if (
+            self.state == "recording"
+            and self.auto_stop_minutes > 0
+            and self._elapsed_secs() >= self.auto_stop_minutes * 60
+        ):
+            self.stop()
         self.root.after(500, self._tick)
 
     def _update_ui(self):
-        color = {"recording": "#ff3b30", "paused": "#ff9500", "idle": "#8e8e93"}[self.state]
+        color = {
+            "recording": "#ff3b30",
+            "paused": "#ff9500",
+            "countdown": "#5965f3",
+            "idle": "#28c79a",
+        }[self.state]
         self.dot.itemconfigure(self.dot_id, fill=color)
         self.time_lbl.configure(text=self._fmt(self._elapsed_secs()))
         self.btn_start.configure(state=("normal" if self.state == "idle" else "disabled"))
         self.btn_fullscreen.configure(state=("normal" if self.state == "idle" else "disabled"))
-        self.btn_pause.configure(state=("disabled" if self.state == "idle" else "normal"),
+        self.btn_pause.configure(state=("normal" if self.state in ("recording", "paused") else "disabled"),
                                  text=("继续" if self.state == "paused" else "暂停"))
-        self.btn_stop.configure(state=("disabled" if self.state == "idle" else "normal"))
+        self.btn_stop.configure(
+            state=("normal" if self.state in ("recording", "paused") else "disabled")
+        )
 
     def _alert(self, msg):
         try:
@@ -873,6 +1477,9 @@ class Recorder:
 
     def _build_tray(self):
         menu = pystray.Menu(
+            pystray.MenuItem("打开工具中心", lambda: self._ui(self.show_tools)),
+            pystray.MenuItem("录制设置", lambda: self._ui(self.show_settings)),
+            pystray.MenuItem("检查更新", lambda: self._ui(self.check_for_updates)),
             pystray.MenuItem("快捷键 / 使用说明", lambda: self._ui(self.show_shortcuts)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("显示/隐藏控制条 (Ctrl+B)", lambda: self._ui(self.toggle_bar)),
@@ -892,6 +1499,7 @@ class Recorder:
 
     def _toggle_system_audio(self, icon, item):
         self.record_system_audio = not self.record_system_audio
+        self._save_settings()
 
     def _quit(self, icon=None, item=None):
         if self.state != "idle":
@@ -911,6 +1519,15 @@ class Recorder:
             keyboard.add_hotkey(HOTKEY_RECORD,
                                 lambda: self._ui(lambda: self.stop() if self.state != "idle" else self.start()),
                                 suppress=True)
+            keyboard.add_hotkey(
+                HOTKEY_PAUSE,
+                lambda: self._ui(
+                    self.pause_resume
+                    if self.state in ("recording", "paused")
+                    else lambda: None
+                ),
+                suppress=True,
+            )
             keyboard.add_hotkey(HOTKEY_SHOT, lambda: self.take_screenshot(), suppress=True)
             keyboard.add_hotkey(HOTKEY_BAR, lambda: self._ui(self.toggle_bar), suppress=True)
         except Exception as e:
